@@ -110,6 +110,35 @@ public class GroqService {
                 String result = toolFunctions.getBestSellers(intent.category);
                 yield new ChatResponse(result, null, null);
             }
+            case REMOVE_ITEM -> {
+                // intent.category = item name to remove (e.g. "Trà Dâu Tây")
+                if (intent.category == null || intent.category.isBlank()) {
+                    yield new ChatResponse("Con muốn xóa món nào vậy? Con nhắn tên món giúp mẹ nha!", null, null);
+                }
+                // First find the item by name
+                String findResult = toolFunctions.findItemByName(intent.category);
+                String itemId = null;
+                String size = null;
+
+                if (findResult != null && findResult.startsWith("FOUND:")) {
+                    String[] parts = findResult.substring(6).split("\\|", -1);
+                    if (parts.length >= 4) {
+                        itemId = parts[0].trim();
+                    }
+                }
+
+                if (itemId == null) {
+                    // Item not found — ask user to be more specific
+                    yield new ChatResponse("Không tìm thấy món '" + intent.category + "' trong giỏ của con. "
+                            + "Con nhắn lại tên món cần xóa giúp mẹ nha!", null, null);
+                }
+
+                // Find and remove the item from cart (default size M, try both)
+                String result1 = toolFunctions.removeFromCart(customer, itemId, "M");
+                String result2 = toolFunctions.removeFromCart(customer, itemId, "L");
+                // If first worked, result1 != error. If both fail, show first result.
+                yield new ChatResponse(result1, null, null);
+            }
             case CHECKOUT -> {
                 // No delivery info yet — need to ask
                 String result = toolFunctions.viewCart(customer);
@@ -273,9 +302,6 @@ public class GroqService {
 
         return switch (toolName) {
             case "find_item_by_name" -> {
-                // FIX: Parse FOUND: result and SAVE pending action immediately.
-                // This is the CORE bug fix — without this, ConfirmationState is NEVER saved
-                // and user YES → handleConfirmation → no pending → Gemini loop → infinite.
                 String raw = toolFunctions.findItemByName(extractString(args, "name"));
 
                 if (raw != null && raw.startsWith("FOUND:")) {
@@ -287,16 +313,15 @@ public class GroqService {
                         String priceM = parts[2].trim();
                         String priceL = parts[3].trim();
 
-                        // Save pending ADD_TO_CART with default M, qty 1
+                        // Save pending state for size-only replies ("M", "L", "lớn")
+                        // DO NOT ask user — just record and tell Gemini to call add_to_cart
                         confirmationState.saveAddToCart(
                                 customer.getId(), itemId, itemName, "M", 1, raw);
 
-                        // Return formatted info for Gemini to ask confirmation
+                        // Key: tell Gemini to call add_to_cart IMMEDIATELY, no confirmation needed
                         yield String.format(
                                 "FOUND_ITEM: %s\nMã: %s\nGiá M: %sđ / Giá L: %sđ\n\n"
-                                + "Hãy hỏi khách: 'Con muốn size M hay L? Mấy ly?' "
-                                + "Sau khi khách trả lời đủ (size + số lượng), "
-                                + "gọi add_to_cart(%s, <size>, <qty>).",
+                                + "Goi ngay add_to_cart('%s', 'M', 1) — khach da noi ten mon roi.",
                                 itemName, itemId, priceM, priceL, itemId);
                     }
                 }
@@ -562,44 +587,59 @@ public class GroqService {
      * 4. Only call function when it makes sense
      */
     private String systemPrompt(Customer customer) {
+        ConfirmationState.PendingAction pending = confirmationState.peek(customer.getId());
+
         StringBuilder sb = new StringBuilder();
         sb.append("""
                 Ban la Me — ba chu quan tra sua Casso. Goi khach la "con".
+                Luon noi tieng Viet co dau, dung emoji.
 
-                LUONG XU LY DAT MON (TUYET DOI PHAI DUNG THU TU):
-                ==========================================
+                CAC LUONG XU LY:
+                ================
 
-                BUOC 1: Khach noi ten mon -> goi find_item_by_name(ten_mon)
-                   -> Tool tra ve: FOUND_ITEM: Ten | Ma: xxx | Gia M: xd / L: yd
-                   -> GOI NGAY add_to_cart(ma, "M", 1)
-                   -> KHONG hoi confirm gi ca
+                1. TIM MON: Khach noi ten mon bat ky
+                   -> goi find_item_by_name(ten_mon)
+                   -> FOUND -> GOI NGAY add_to_cart(ma, size, soluong)
+                      KHONG hoi xac nhan gi ca
+                   -> KHONG TIM THAY -> tra loi "khong co mon nay, con thu ten khac nha"
 
-                BUOC 2: add_to_cart tra ve "Da them..."
-                   -> Tra loi: "Da them X ly Y vao gio nha con!" 🛒
-                   -> Hoi: "Con muon them gi nua khong?"
+                2. XEM MENU: "menu", "thuc don"
+                   -> goi get_menu() -> tra day du thuc don
 
-                CAC TRUONG HOP KHAC:
-                ==========================================
+                3. XEM GIO: "gio hang", "xem don"
+                   -> goi view_cart() -> tra gio hang + tong tien
 
-                » "menu" / "thuc don" / "xem thuc don"
-                   -> Goi get_menu() -> IN DAY DU menu
+                4. XOA MON: "huy [ten mon]", "xoa [ten mon]"
+                   -> goi remove_from_cart(ma_mon, size)
 
-                » "gio hang" / "bill" / "xem don" / "check cart"
-                   -> Goi view_cart() -> IN GIO HANG
+                5. XOA GIO: "xoa gio", "huy gio"
+                   -> goi clear_cart()
 
-                » "thanh toan" / "checkout"
-                   -> Goi view_cart() xem gio
-                   -> TRONG -> "Gio hang trong con oi!"
-                   -> CO MON -> hoi: "Cho me biet: Ten, SDT, dia chi giao hang nha"
+                6. THANH TOAN: "thanh toan"
+                   -> goi view_cart() xem gio
+                   -> GIO TRONG -> "Gio hang trong con oi!"
+                   -> CO MON -> hoi: "Cho me biet ten, SDT, dia chi giao hang nha"
 
-                » "xoa gio" -> Goi clear_cart()
-                » "ban chay" -> Goi get_best_sellers()
+                7. XAC NHAN TU DONG: Khach tra loi size ("M", "L", "lon", "nho")
+                   -> Tu dong goi add_to_cart(ma_da_tim, size, soluong)
 
-                QUY TAC 1: Co itemId + size -> GOI NGAY, KHONG HOI
-                QUY TAC 2: Hoi gio hang -> IN GIO HANG, khong hoi gi khac
-                QUY TAC 3: KHONG bao gio hoi lai thong tin da co
-                QUY TAC 4: Noi CHUYEN, dung emoji 🧋😊
+                QUY TAC:
+                =======
+                - Co itemId -> GOI add_to_cart NGAY, KHONG hoi
+                - Gio hang -> IN GIO, khong hoi gi
+                - Khong bao gio hoi lai thong tin da co
+                - speak naturally, tieng Viet co dau
                 """);
+
+        // Inject pending state so Gemini knows what's happening
+        if (pending != null && pending.type() == ConfirmationState.ActionType.ADD_TO_CART) {
+            sb.append(String.format(
+                    "\n\nDANG CHO XAC NHAN: %s (size %s, %d ly, ma %s)\n"
+                    + "Neu khach tra loi size -> goi add_to_cart('%s', <size>, %d)\n"
+                    + "Neu khach noi 'huy' -> xoa pending",
+                    pending.itemName(), pending.size(), pending.quantity(), pending.itemId(),
+                    pending.itemId(), pending.quantity()));
+        }
 
         return sb.toString();
     }

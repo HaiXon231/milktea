@@ -197,6 +197,38 @@ class IntentDetectorTest {
         }
     }
 
+    // ── REMOVE ITEM ─────────────────────────────────────────────────
+
+    @Nested
+    class RemoveItemIntents {
+        @Test
+        @DisplayName("'hủy trà dâu tây' should be REMOVE_ITEM")
+        void huy_item() {
+            var intent = detector.detect("hủy trà dâu tây", null);
+            assertNotNull(intent);
+            assertEquals(IntentDetector.DetectedIntent.Type.REMOVE_ITEM, intent.type);
+            assertTrue(intent.category.toLowerCase().contains("dâu tây"));
+        }
+
+        @Test
+        @DisplayName("'xóa trà sữa socola' should be REMOVE_ITEM")
+        void xoa_item() {
+            var intent = detector.detect("xóa trà sữa socola", null);
+            assertNotNull(intent);
+            assertEquals(IntentDetector.DetectedIntent.Type.REMOVE_ITEM, intent.type);
+            assertTrue(intent.category.toLowerCase().contains("socola"));
+        }
+
+        @Test
+        @DisplayName("'bỏ ly matcha đi' should be REMOVE_ITEM")
+        void bo_ly_item() {
+            var intent = detector.detect("bỏ ly matcha đi", null);
+            assertNotNull(intent);
+            assertEquals(IntentDetector.DetectedIntent.Type.REMOVE_ITEM, intent.type);
+            assertTrue(intent.category.toLowerCase().contains("matcha"));
+        }
+    }
+
     // ── GREETING ───────────────────────────────────────────────────
 
     @Nested

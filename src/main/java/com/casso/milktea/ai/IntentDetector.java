@@ -54,6 +54,12 @@ public class IntentDetector {
             return DetectedIntent.viewCart();
         }
 
+        // REMOVE SPECIFIC ITEM from cart — "hủy trà dâu tây", "xóa trà sữa socola"
+        if (isRemoveItemRequest(lower, msg)) {
+            String itemName = extractItemNameFromRemoveRequest(lower, msg);
+            return DetectedIntent.removeItem(itemName);
+        }
+
         // CLEAR CART
         if (lower.equals("xóa giỏ") || lower.equals("bỏ giỏ") || lower.equals("hủy giỏ")
                 || lower.equals("xóa hết") || lower.equals("bỏ hết") || lower.equals("clear cart")
@@ -204,6 +210,52 @@ public class IntentDetector {
     }
 
     /**
+     * Detects "hủy [món]", "xóa [món]", "bỏ [món]" — remove specific item from cart.
+     * Examples: "hủy trà dâu tây", "xóa trà sữa socola", "bỏ ly matcha đi"
+     */
+    private boolean isRemoveItemRequest(String lower, String original) {
+        String[] removePrefixes = {"hủy", "huy", "xóa", "xoa", "bỏ", "bo", "xóa ly", "xoa ly",
+                "bỏ ly", "bo ly", "hủy ly", "huy ly"};
+        for (String prefix : removePrefixes) {
+            if (lower.startsWith(prefix + " ") || lower.startsWith(prefix + " ly ")
+                    || lower.startsWith(prefix + " đi") || lower.startsWith(prefix + " di")) {
+                return true;
+            }
+        }
+        return false;
+    }
+
+    /**
+     * Extract the item name from a remove request.
+     * "hủy trà dâu tây" → "trà dâu tây"
+     * "xóa ly trà sữa socola đi" → "trà sữa socola"
+     */
+    private String extractItemNameFromRemoveRequest(String lower, String original) {
+        String[] prefixes = {"hủy ly", "huy ly", "hủy ", "huy ", "xóa ly", "xoa ly",
+                "xóa ", "xoa ", "bỏ ly", "bo ly", "bỏ ", "bo "};
+        for (String prefix : prefixes) {
+            if (lower.startsWith(prefix)) {
+                String name = lower.substring(prefix.length()).trim();
+                // Remove trailing "đi", "di", "với"
+                if (name.endsWith(" đi") || name.endsWith(" di")) {
+                    name = name.substring(0, name.length() - 3).trim();
+                }
+                if (!name.isEmpty()) {
+                    return capitalize(name);
+                }
+            }
+        }
+        return null;
+    }
+
+    private String capitalize(String s) {
+        if (s == null || s.isEmpty()) return s;
+        String trimmed = s.trim();
+        if (trimmed.isEmpty()) return s;
+        return Character.toUpperCase(trimmed.charAt(0)) + trimmed.substring(1);
+    }
+
+    /**
      * Extract category after a keyword like "menu", "thực đơn", etc.
      * e.g. "menu tra sua" → "Tra Sua"
      */
@@ -246,7 +298,7 @@ public class IntentDetector {
     public static class DetectedIntent {
         public enum Type {
             // Tool calls — handled without Gemini
-            MENU, VIEW_CART, CLEAR_CART, BEST_SELLERS, CHECKOUT,
+            MENU, VIEW_CART, CLEAR_CART, BEST_SELLERS, CHECKOUT, REMOVE_ITEM,
             // Non-tool — respond directly
             GREETING, HELP, AFFIRM, NEGATE, SIZE_ONLY,
             // Needs Gemini reasoning
@@ -297,7 +349,11 @@ public class IntentDetector {
         public boolean isToolCall() {
             return type == Type.MENU || type == Type.VIEW_CART
                     || type == Type.CLEAR_CART || type == Type.BEST_SELLERS
-                    || type == Type.CHECKOUT;
+                    || type == Type.CHECKOUT || type == Type.REMOVE_ITEM;
+        }
+
+        public static DetectedIntent removeItem(String itemName) {
+            return new DetectedIntent(Type.REMOVE_ITEM, itemName, null);
         }
     }
 }
