@@ -264,15 +264,23 @@ public class GroqService {
                     String toolName = (String) tc.get("name");
                     JsonNode rawArgs = (JsonNode) tc.get("args");
                     String result = executeTool(toolName, rawArgs, customer, contents);
-
                     contents.add(functionResponsePart(toolName, result));
                     log.info("Tool [{}] → {}", toolName,
                             result.length() > 120 ? result.substring(0, 120) + "..." : result);
                 }
 
-                // Turn 2: Gemini generates natural response with tool results
-                response = callGeminiWithRetry(contents, false);
-                text = extractText(response);
+                // Turn 2: Gemini generates natural response.
+                // IMPORTANT: skip if the ONLY tool was find_item_by_name (already executed
+                // server-side, cart is updated). Gemini seeing "Đã thêm..." and calling
+                // add_to_cart again would double-add to cart.
+                boolean onlyFindItem = toolCalls.size() == 1
+                        && "find_item_by_name".equals(toolCalls.get(0).get("name"));
+
+                if (!onlyFindItem) {
+                    response = callGeminiWithRetry(contents, false);
+                    text = extractText(response);
+                }
+                // If only find_item_by_name: skip Turn 2, use the add_to_cart result as-is
             }
 
             if (text == null || text.isBlank()) {
@@ -313,16 +321,18 @@ public class GroqService {
                         String priceM = parts[2].trim();
                         String priceL = parts[3].trim();
 
-                        // Save pending state for size-only replies ("M", "L", "lớn")
-                        // DO NOT ask user — just record and tell Gemini to call add_to_cart
+                        // CRITICAL FIX: Execute add_to_cart HERE, not in Turn 2.
+                        // Gemini may not call the tool — we can't rely on it.
+                        // Adding directly guarantees the cart is updated.
+                        String cartResult = toolFunctions.addToCart(customer, itemId, "M", 1);
+
+                        // Save pending state for potential size override ("M", "L")
                         confirmationState.saveAddToCart(
                                 customer.getId(), itemId, itemName, "M", 1, raw);
 
-                        // Key: tell Gemini to call add_to_cart IMMEDIATELY, no confirmation needed
-                        yield String.format(
-                                "FOUND_ITEM: %s\nMã: %s\nGiá M: %sđ / Giá L: %sđ\n\n"
-                                + "Goi ngay add_to_cart('%s', 'M', 1) — khach da noi ten mon roi.",
-                                itemName, itemId, priceM, priceL, itemId);
+                        // Return cart result directly — this IS the response
+                        // (don't let Gemini "improve" it and accidentally skip the add)
+                        yield cartResult;
                     }
                 }
                 // Not found or error — return as-is for Gemini to handle
