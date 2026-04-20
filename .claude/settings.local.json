@@ -38,7 +38,15 @@
       "Bash(magick convert *)",
       "Bash(mvn clean *)",
       "Skill(gsd:new-project)",
-      "Bash(git add *)"
+      "Bash(git add *)",
+      "Bash(git commit -m ' *)",
+      "Bash(curl -s -X POST https://api.groq.com/openai/v1/chat/completions -H 'Authorization: Bearer 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' -H 'Content-Type: application/json' -d '{\"model\":\"llama-3.3-70b-versatile\",\"messages\":[{\"role\":\"user\",\"content\":\"xin chao\"}],\"max_tokens\":20}' -w '\\\\nHTTP_CODE:%{http_code}')",
+      "Bash(curl *)",
+      "Bash(python *)",
+      "Bash(mvn spring-boot:run -q)",
+      "Bash(netstat -ano)",
+      "Bash(taskkill //F //PID 25760)",
+      "Bash(echo \"PID: $!\")"
     ]
   }
 }

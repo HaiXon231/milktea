@@ -18,8 +18,8 @@ import java.util.*;
  * Direct Gemini API integration — bypasses Spring AI completely.
  *
  * Request flow:
- *  1. IntentDetector (fast path) — handles simple, high-confidence intents
- *  2. Gemini (reasoning path) — complex conversations, ambiguous requests
+ * 1. IntentDetector (fast path) — handles simple, high-confidence intents
+ * 2. Gemini (reasoning path) — complex conversations, ambiguous requests
  *
  * ConfirmationState tracks pending confirmations so we don't ask twice.
  */
@@ -44,7 +44,7 @@ public class GroqService {
     private String model;
 
     // ══════════════════════════════════════════════════════════════
-    //  PUBLIC ENTRY POINT
+    // PUBLIC ENTRY POINT
     // ══════════════════════════════════════════════════════════════
 
     public ChatResponse chat(Customer customer, String userMessage,
@@ -68,7 +68,7 @@ public class GroqService {
         // AFFIRM / NEGATE — handle pending confirmations FIRST
         if (intent != null
                 && (intent.type == IntentDetector.DetectedIntent.Type.AFFIRM
-                    || intent.type == IntentDetector.DetectedIntent.Type.NEGATE)) {
+                        || intent.type == IntentDetector.DetectedIntent.Type.NEGATE)) {
             return handleConfirmation(customer, intent.type == IntentDetector.DetectedIntent.Type.AFFIRM);
         }
 
@@ -87,7 +87,7 @@ public class GroqService {
     }
 
     // ══════════════════════════════════════════════════════════════
-    //  FAST PATH — DIRECT TOOL CALLS
+    // FAST PATH — DIRECT TOOL CALLS
     // ══════════════════════════════════════════════════════════════
 
     private ChatResponse handleDirectToolCall(Customer customer,
@@ -125,7 +125,7 @@ public class GroqService {
     }
 
     // ══════════════════════════════════════════════════════════════
-    //  CONFIRMATION HANDLING
+    // CONFIRMATION HANDLING
     // ══════════════════════════════════════════════════════════════
 
     /**
@@ -210,7 +210,7 @@ public class GroqService {
     }
 
     // ══════════════════════════════════════════════════════════════
-    //  GEMINI REASONING PATH
+    // GEMINI REASONING PATH
     // ══════════════════════════════════════════════════════════════
 
     private ChatResponse chatWithGemini(Customer customer, String userMessage,
@@ -259,7 +259,7 @@ public class GroqService {
     }
 
     // ══════════════════════════════════════════════════════════════
-    //  TOOL EXECUTION
+    // TOOL EXECUTION
     // ══════════════════════════════════════════════════════════════
 
     /**
@@ -273,10 +273,35 @@ public class GroqService {
 
         return switch (toolName) {
             case "find_item_by_name" -> {
-                String result = toolFunctions.findItemByName(extractString(args, "name"));
-                // NOTE: We do NOT auto-add here. The result is returned to Gemini
-                // so it can ask confirmation. Gemini will call add_to_cart AFTER confirming.
-                yield result;
+                // FIX: Parse FOUND: result and SAVE pending action immediately.
+                // This is the CORE bug fix — without this, ConfirmationState is NEVER saved
+                // and user YES → handleConfirmation → no pending → Gemini loop → infinite.
+                String raw = toolFunctions.findItemByName(extractString(args, "name"));
+
+                if (raw != null && raw.startsWith("FOUND:")) {
+                    // Parse: FOUND:itemId|name|priceM|priceL
+                    String[] parts = raw.substring(6).split("\\|", -1);
+                    if (parts.length >= 4) {
+                        String itemId = parts[0].trim();
+                        String itemName = parts[1].trim();
+                        String priceM = parts[2].trim();
+                        String priceL = parts[3].trim();
+
+                        // Save pending ADD_TO_CART with default M, qty 1
+                        confirmationState.saveAddToCart(
+                                customer.getId(), itemId, itemName, "M", 1, raw);
+
+                        // Return formatted info for Gemini to ask confirmation
+                        yield String.format(
+                                "FOUND_ITEM: %s\nMã: %s\nGiá M: %sđ / Giá L: %sđ\n\n"
+                                + "Hãy hỏi khách: 'Con muốn size M hay L? Mấy ly?' "
+                                + "Sau khi khách trả lời đủ (size + số lượng), "
+                                + "gọi add_to_cart(%s, <size>, <qty>).",
+                                itemName, itemId, priceM, priceL, itemId);
+                    }
+                }
+                // Not found or error — return as-is for Gemini to handle
+                yield raw;
             }
 
             case "get_menu" -> toolFunctions.getMenu(extractString(args, "category"));
@@ -287,7 +312,10 @@ public class GroqService {
                 String itemId = extractString(args, "item_id");
                 String size = normalizeSize(extractString(args, "size"));
                 int qty = extractInt(args, "quantity", 1);
-                yield toolFunctions.addToCart(customer, itemId, size, qty);
+                String result = toolFunctions.addToCart(customer, itemId, size, qty);
+                // Clear any stale pending confirmations after adding
+                confirmationState.clear(customer.getId());
+                yield result;
             }
 
             case "remove_from_cart" -> toolFunctions.removeFromCart(customer,
@@ -306,20 +334,18 @@ public class GroqService {
                 String address = extractString(args, "address");
                 String note = extractString(args, "note");
 
-                // Validate — if missing info, tell Gemini to ask
+                // Validate — if missing info, DO NOT call checkout
                 String missing = validateDeliveryInfo(name, phone, address);
                 if (missing != null) {
-                    // DO NOT call real checkout — return instruction to ask user
                     confirmationState.clear(customer.getId()); // clear stale state
                     yield "THIẾU_THÔNG_TIN: " + missing
-                            + ". Hãy hỏi khách cung cấp thông tin còn thiếu trước khi gọi checkout.";
+                            + ". Hãy hỏi khách cung cấp thông tin còn thiếu.";
                 }
 
                 // All info present — execute checkout
                 var orderResult = toolFunctions.checkout(customer, name, phone, address, note);
                 confirmationState.clear(customer.getId());
 
-                // Return structured result for Gemini to parse
                 if (orderResult.success()) {
                     yield "CHECKOUT_THÀNH_CÔNG|"
                             + orderResult.orderCode() + "|"
@@ -345,15 +371,19 @@ public class GroqService {
      */
     private String validateDeliveryInfo(String name, String phone, String address) {
         StringBuilder sb = new StringBuilder();
-        if (name == null || name.isBlank()) sb.append("tên người nhận, ");
-        if (phone == null || phone.isBlank()) sb.append("số điện thoại, ");
-        if (address == null || address.isBlank()) sb.append("địa chỉ giao hàng, ");
-        if (sb.isEmpty()) return null;
+        if (name == null || name.isBlank())
+            sb.append("tên người nhận, ");
+        if (phone == null || phone.isBlank())
+            sb.append("số điện thoại, ");
+        if (address == null || address.isBlank())
+            sb.append("địa chỉ giao hàng, ");
+        if (sb.isEmpty())
+            return null;
         return sb.substring(0, sb.length() - 2);
     }
 
     // ══════════════════════════════════════════════════════════════
-    //  GEMINI HTTP CALLS
+    // GEMINI HTTP CALLS
     // ══════════════════════════════════════════════════════════════
 
     private JsonNode callGemini(List<Map<String, Object>> contents, boolean withTools)
@@ -410,7 +440,11 @@ public class GroqService {
                     if (attempts < 3) {
                         int waitMs = attempts * 2000;
                         log.warn("Gemini retry {}/3 ({}): {}", attempts, e.getMessage(), waitMs);
-                        try { Thread.sleep(waitMs); } catch (InterruptedException ie) { break; }
+                        try {
+                            Thread.sleep(waitMs);
+                        } catch (InterruptedException ie) {
+                            break;
+                        }
                         continue;
                     }
                 }
@@ -422,7 +456,7 @@ public class GroqService {
     }
 
     // ══════════════════════════════════════════════════════════════
-    //  GEMINI CONTENTS BUILDERS
+    // GEMINI CONTENTS BUILDERS
     // ══════════════════════════════════════════════════════════════
 
     /**
@@ -471,7 +505,7 @@ public class GroqService {
     }
 
     // ══════════════════════════════════════════════════════════════
-    //  RESPONSE EXTRACTION
+    // RESPONSE EXTRACTION
     // ══════════════════════════════════════════════════════════════
 
     private String extractText(JsonNode response) {
@@ -482,7 +516,8 @@ public class GroqService {
             for (JsonNode p : parts) {
                 String t = p.path("text").asText(null);
                 if (t != null && !t.isBlank()) {
-                    if (sb.length() > 0) sb.append("\n");
+                    if (sb.length() > 0)
+                        sb.append("\n");
                     sb.append(t);
                 }
             }
@@ -513,7 +548,7 @@ public class GroqService {
     }
 
     // ══════════════════════════════════════════════════════════════
-    //  SYSTEM PROMPT — VIETNAMESE MOTHER AS TEA SHOP OWNER
+    // SYSTEM PROMPT — VIETNAMESE MOTHER AS TEA SHOP OWNER
     // ══════════════════════════════════════════════════════════════
 
     /**
@@ -529,111 +564,111 @@ public class GroqService {
     private String systemPrompt(Customer customer) {
         StringBuilder sb = new StringBuilder();
         sb.append("""
-            Bạn là Mẹ — bà chủ quán trà sữa Casso. Bạn nói chuyện như một người mẹ Việt Nam thân thiện,
-            hay nói chuyện, gọi khách là "con". KHÔNG nói như robot hay chatbot.
+                Bạn là Mẹ — bà chủ quán trà sữa Casso. Bạn nói chuyện như một người mẹ Việt Nam thân thiện,
+                hay nói chuyện, gọi khách là "con". KHÔNG nói như robot hay chatbot.
 
-            TÍNH CÁCH:
-            - Nói chuyện TỰ NHIÊN, THÂN THIỆN, có cảm xúc
-            - Hay dùng emoji nhẹ như 🧋😊❤️
-            - Gợi ý đồ uống, hỏi han vị khách
-            - Giọng truyền cảm hứng, như người bạn tốt
+                TÍNH CÁCH:
+                - Nói chuyện TỰ NHIÊN, THÂN THIỆN, có cảm xúc
+                - Hay dùng emoji nhẹ như 🧋😊❤️
+                - Gợi ý đồ uống, hỏi han vị khách
+                - Giọng truyền cảm hứng, như người bạn tốt
 
-            KHI PHẢN HỒI KHÁCH HÀNG, HÃY LÀM THEO CÁC QUY TẮC SAU:
+                KHI PHẢN HỒI KHÁCH HÀNG, HÃY LÀM THEO CÁC QUY TẮC SAU:
 
-            ══════════════════════════════════════════════
-            QUY TẮC #1: NHẬN DIỆN Ý ĐỊNH (INTENT)
-            ══════════════════════════════════════════════
-            Trước khi trả lời, xác định ý định của khách:
+                ══════════════════════════════════════════════
+                QUY TẮC #1: NHẬN DIỆN Ý ĐỊNH (INTENT)
+                ══════════════════════════════════════════════
+                Trước khi trả lời, xác định ý định của khách:
 
-            » "menu" / "xem menu" / "thực đơn"
-               → Gọi get_menu() → TRẢ ĐẦY ĐỦ MENU
+                » "menu" / "xem menu" / "thực đơn"
+                   → Gọi get_menu() → TRẢ ĐẦY ĐỦ MENU
 
-            » "giỏ hàng" / "xem đơn" / "bill" / "check cart"
-               → Gọi view_cart() → HIỂN THỊ GIỎ HÀNG
+                » "giỏ hàng" / "xem đơn" / "bill" / "check cart"
+                   → Gọi view_cart() → HIỂN THỊ GIỎ HÀNG
 
-            » "bán chạy" / "best seller" / "hot"
-               → Gọi get_best_sellers()
+                » "bán chạy" / "best seller" / "hot"
+                   → Gọi get_best_sellers()
 
-            » "thanh toán" / "checkout" / "QR"
-               → Gọi view_cart() TRƯỚC để xem có gì trong giỏ không
-               → Nếu giỏ TRỐNG → nói khách thêm món trước
-               → Nếu giỏ CÓ MÓN → hỏi thông tin giao hàng (tên, SDT, địa chỉ)
+                » "thanh toán" / "checkout" / "QR"
+                   → Gọi view_cart() TRƯỚC để xem có gì trong giỏ không
+                   → Nếu giỏ TRỐNG → nói khách thêm món trước
+                   → Nếu giỏ CÓ MÓN → hỏi thông tin giao hàng (tên, SDT, địa chỉ)
 
-            » "xóa giỏ" / "bỏ hết"
-               → Gọi clear_cart()
+                » "xóa giỏ" / "bỏ hết"
+                   → Gọi clear_cart()
 
-            » Khách nói tên món ("trà sữa socola", "matcha", "sữa tươi")
-               → Gọi find_item_by_name(tên_món)
-               → Nếu kết quả bắt đầu bằng "FOUND:" →
-                 - NẾU khách đã nói đủ thông tin (size + số lượng):
-                   VD: "trà sữa socola size M 2 ly"
-                   → Gọi add_to_cart() NGAY, KHÔNG hỏi lại
-                 - NẾU khách CHỈ nói tên món (không nói size/số lượng):
-                   → HỎI XÁC NHẬN: "Trà sữa Socola như vậy nhe con — con muốn size M hay L? Mấy ly?"
+                » Khách nói tên món ("trà sữa socola", "matcha", "sữa tươi")
+                   → Gọi find_item_by_name(tên_món)
+                   → Nếu kết quả bắt đầu bằng "FOUND:" →
+                     - NẾU khách đã nói đủ thông tin (size + số lượng):
+                       VD: "trà sữa socola size M 2 ly"
+                       → Gọi add_to_cart() NGAY, KHÔNG hỏi lại
+                     - NẾU khách CHỈ nói tên món (không nói size/số lượng):
+                       → HỎI XÁC NHẬN: "Trà sữa Socola như vậy nhe con — con muốn size M hay L? Mấy ly?"
 
-            ══════════════════════════════════════════════
-            QUY TẮC #2: KHÔNG HỎI LẠI THÔNG TIN ĐÃ CÓ
-            ══════════════════════════════════════════════
-            Nếu khách đã cung cấp đầy đủ thông tin cho một action,
-            THỰC HIỆN NGAY, KHÔNG hỏi lại.
+                ══════════════════════════════════════════════
+                QUY TẮC #2: KHÔNG HỎI LẠI THÔNG TIN ĐÃ CÓ
+                ══════════════════════════════════════════════
+                Nếu khách đã cung cấp đầy đủ thông tin cho một action,
+                THỰC HIỆN NGAY, KHÔNG hỏi lại.
 
-            Ví dụ:
-            ✗ SAI: Khách: "trà sữa socola size M" → AI: "Con muốn size M hay L?" ← HỎI LẠI
-            ✓ ĐÚNG: Khách: "trà sữa socola size M" → AI: (tìm thấy FOUND:) →
-                    Gọi add_to_cart(TS01, M, 1) → "Đã thêm 1 ly Trà sữa Socola size M vào giỏ nha con!"
+                Ví dụ:
+                ✗ SAI: Khách: "trà sữa socola size M" → AI: "Con muốn size M hay L?" ← HỎI LẠI
+                ✓ ĐÚNG: Khách: "trà sữa socola size M" → AI: (tìm thấy FOUND:) →
+                        Gọi add_to_cart(TS01, M, 1) → "Đã thêm 1 ly Trà sữa Socola size M vào giỏ nha con!"
 
-            ✗ SAI: Khách: "thanh toán, tên Minh, SDT 0912345678, địa chỉ 123 Nguyễn Trãi"
-                   → AI: "Con cho mẹ biết tên..." ← HỎI LẠI
-            ✓ ĐÚNG: → Gọi checkout(name=Minh, phone=0912345678, address=123 Nguyễn Trãi)
-                     → "Đơn hàng #12345 của con nè! Tổng cộng 45,000đ. Quét QR để thanh toán nha!"
+                ✗ SAI: Khách: "thanh toán, tên Minh, SDT 0912345678, địa chỉ 123 Nguyễn Trãi"
+                       → AI: "Con cho mẹ biết tên..." ← HỎI LẠI
+                ✓ ĐÚNG: → Gọi checkout(name=Minh, phone=0912345678, address=123 Nguyễn Trãi)
+                         → "Đơn hàng #12345 của con nè! Tổng cộng 45,000đ. Quét QR để thanh toán nha!"
 
-            ══════════════════════════════════════════════
-            QUY TẮC #3: TRẢ LỜI ĐÚNG YÊU CẦU
-            ══════════════════════════════════════════════
-            Khi khách hỏi một thứ cụ thể (giỏ hàng, menu, best seller),
-            TRẢ LỜI ĐÚNG Ý ĐỊNH đó, KHÔNG chuyển hướng sang "con muốn uống gì".
+                ══════════════════════════════════════════════
+                QUY TẮC #3: TRẢ LỜI ĐÚNG YÊU CẦU
+                ══════════════════════════════════════════════
+                Khi khách hỏi một thứ cụ thể (giỏ hàng, menu, best seller),
+                TRẢ LỜI ĐÚNG Ý ĐỊNH đó, KHÔNG chuyển hướng sang "con muốn uống gì".
 
-            ✗ SAI: Khách: "xem giỏ hàng đi" → AI: "Con muốn uống gì hôm nay?" ← SAI
-            ✓ ĐÚNG: Khách: "xem giỏ hàng đi" → Gọi view_cart() → HIỂN THỊ GIỎ HÀNG
+                ✗ SAI: Khách: "xem giỏ hàng đi" → AI: "Con muốn uống gì hôm nay?" ← SAI
+                ✓ ĐÚNG: Khách: "xem giỏ hàng đi" → Gọi view_cart() → HIỂN THỊ GIỎ HÀNG
 
-            ══════════════════════════════════════════════
-            QUY T�ẮC #4: KHI KẾT QUẢ TOOL TRẢ VỀ
-            ══════════════════════════════════════════════
+                ══════════════════════════════════════════════
+                QUY T�ẮC #4: KHI KẾT QUẢ TOOL TRẢ VỀ
+                ══════════════════════════════════════════════
 
-            » get_menu() trả về menu đầy đủ
-               → In ra ĐẦY ĐỦ menu theo từng danh mục
+                » get_menu() trả về menu đầy đủ
+                   → In ra ĐẦY ĐỦ menu theo từng danh mục
 
-            » find_item_by_name() trả "FOUND:itemId|tên|giáM|giáL"
-               → ĐÃ đủ size + số lượng → Gọi add_to_cart NGAY
-               → CHƯA đủ → Hỏi xác nhận: size gì? mấy ly?
+                » find_item_by_name() trả "FOUND:itemId|tên|giáM|giáL"
+                   → ĐÃ đủ size + số lượng → Gọi add_to_cart NGAY
+                   → CHƯA đủ → Hỏi xác nhận: size gì? mấy ly?
 
-            » view_cart() trả giỏ hàng
-               → In ra giỏ hàng, KHÔNG hỏi thêm gì trừ khi khách yêu cầu
+                » view_cart() trả giỏ hàng
+                   → In ra giỏ hàng, KHÔNG hỏi thêm gì trừ khi khách yêu cầu
 
-            » get_best_sellers() trả danh sách
-               → In ra danh sách, gợi ý khách chọn
+                » get_best_sellers() trả danh sách
+                   → In ra danh sách, gợi ý khách chọn
 
-            » checkout() trả "CHECKOUT_THÀNH_CÔNG|orderCode|paymentUrl|message"
-               → In thông tin đơn hàng + LINK THANH TOÁN (RẤT QUAN TRỌNG)
-               → Phải có link QR để khách quét
+                » checkout() trả "CHECKOUT_THÀNH_CÔNG|orderCode|paymentUrl|message"
+                   → In thông tin đơn hàng + LINK THANH TOÁN (RẤT QUAN TRỌNG)
+                   → Phải có link QR để khách quét
 
-            » checkout() trả "THIẾU_THÔNG_TIN: ..."
-               → HỎI KHÁCH cung cấp thông tin còn thiếu thôi
+                » checkout() trả "THIẾU_THÔNG_TIN: ..."
+                   → HỎI KHÁCH cung cấp thông tin còn thiếu thôi
 
-            ══════════════════════════════════════════════
-            QUY TẮC #5: GIỌNG VÀ PHONG CÁCH
-            ══════════════════════════════════════════════
-            - Nói CHUYỆN, không phải báo cáo
-            - Dùng emoji nhẹ nhàng
-            - Kết thúc bằng câu mời: "Con muốn uống gì nữa không?" sau khi thêm món
-            - Khen khách khi chọn món ngon: "Ơ, con biết chọn nè!" 😊
-            """);
+                ══════════════════════════════════════════════
+                QUY TẮC #5: GIỌNG VÀ PHONG CÁCH
+                ══════════════════════════════════════════════
+                - Nói CHUYỆN, không phải báo cáo
+                - Dùng emoji nhẹ nhàng
+                - Kết thúc bằng câu mời: "Con muốn uống gì nữa không?" sau khi thêm món
+                - Khen khách khi chọn món ngon: "Ơ, con biết chọn nè!" 😊
+                """);
 
         return sb.toString();
     }
 
     // ══════════════════════════════════════════════════════════════
-    //  GEMINI FUNCTION DECLARATIONS
+    // GEMINI FUNCTION DECLARATIONS
     // ══════════════════════════════════════════════════════════════
 
     private List<Map<String, Object>> buildFunctionDeclarations() {
@@ -643,13 +678,13 @@ public class GroqService {
                                 + "VD: 'tra sua socola', 'matcha', 'sua tuoi'. "
                                 + "Tra ve 'FOUND:itemId|ten|priceM|priceL' hoac loi khong tim thay.",
                         List.of(param("name", "string",
-                                "Ten mon tieng Viet (VD: 'tra sua socola', 'matcha')")))),
+                                "Ten mon tieng Viet (VD: 'tra sua socola', 'matcha')"))),
 
                 fd("get_menu",
                         "Xem TOAN BO menu: ten mon, gia M/L theo tung danh muc. "
                                 + "Luon tra day du menu khi khach yeu cau.",
                         List.of(param("category", "string",
-                                "Danh muc (tuy chon): Tra Sua, Tra Trai Cay, Ca Phe, Da Xay, Topping")))),
+                                "Danh muc (tuy chon): Tra Sua, Tra Trai Cay, Ca Phe, Da Xay, Topping"))),
 
                 fd("view_cart",
                         "Xem gio hang hien tai cua khach. Tra ve danh sach mon + tong tien.",
@@ -690,15 +725,14 @@ public class GroqService {
                                 + "BAT BUOC phai co: ten nguoi nhan, SDT, dia chi giao hang. "
                                 + "Neu thieu thong tin -> KHONG goi, hoi khach truoc!",
                         List.of(
-                                param("name",    "string", "Ten nguoi nhan"),
-                                param("phone",   "string", "So dien thoai nguoi nhan"),
+                                param("name", "string", "Ten nguoi nhan"),
+                                param("phone", "string", "So dien thoai nguoi nhan"),
                                 param("address", "string", "Dia chi giao hang day du"),
-                                param("note",    "string", "Ghi chu don hang (tuy chon)"))),
+                                param("note", "string", "Ghi chu don hang (tuy chon)"))),
 
                 fd("recommend",
                         "Go y do uong theo so thich. VD: 'socola', 'tra xanh', 'matcha'.",
-                        List.of(param("preference", "string", "So thich hoac ban than (tuy chon)")))
-        );
+                        List.of(param("preference", "string", "So thich hoac ban than (tuy chon)"))));
     }
 
     private Map<String, Object> fd(String name, String desc, List<Map<String, Object>> params) {
@@ -727,7 +761,7 @@ public class GroqService {
     }
 
     // ══════════════════════════════════════════════════════════════
-    //  HELPERS
+    // HELPERS
     // ══════════════════════════════════════════════════════════════
 
     private String extractString(JsonNode args, String field) {
@@ -741,19 +775,25 @@ public class GroqService {
     }
 
     private String normalizeSize(String size) {
-        if (size == null || size.isBlank()) return "M";
+        if (size == null || size.isBlank())
+            return "M";
         String s = size.trim().toUpperCase();
         return s.startsWith("L") ? "L" : "M";
     }
 
     private String extractSize(String msg) {
-        if (msg == null) return null;
+        if (msg == null)
+            return null;
         String s = msg.toUpperCase().trim();
-        if (s.equals("L") || s.equals("LỚN") || s.equals("LARGE")) return "L";
-        if (s.equals("M") || s.equals("NHỎ") || s.equals("MEDIUM")) return "M";
+        if (s.equals("L") || s.equals("LỚN") || s.equals("LARGE"))
+            return "L";
+        if (s.equals("M") || s.equals("NHỎ") || s.equals("MEDIUM"))
+            return "M";
         // "size L", "size M"
-        if (s.contains("L") && !s.contains("M")) return "L";
-        if (s.contains("M")) return "M";
+        if (s.contains("L") && !s.contains("M"))
+            return "L";
+        if (s.contains("M"))
+            return "M";
         return null;
     }
 
@@ -768,17 +808,17 @@ public class GroqService {
 
     private String buildHelpText() {
         return """
-            🧋 Mẹ là AI của quán trà sữa Casso nè!
+                🧋 Mẹ là AI của quán trà sữa Casso nè!
 
-            Con có thể:
-            • "xem menu" — xem toàn bộ thực đơn
-            • "bán chạy" — xem món hot nhất
-            • Nói tên món con thích — VD: "trà sữa socola"
-            • "xem giỏ hàng" — kiểm tra đơn đã đặt
-            • "thanh toán" — tạo QR chuyển khoản
+                Con có thể:
+                • "xem menu" — xem toàn bộ thực đơn
+                • "bán chạy" — xem món hot nhất
+                • Nói tên món con thích — VD: "trà sữa socola"
+                • "xem giỏ hàng" — kiểm tra đơn đã đặt
+                • "thanh toán" — tạo QR chuyển khoản
 
-            Con muốn uống gì nào? 😊
-            """;
+                Con muốn uống gì nào? 😊
+                """;
     }
 
     private String buildAddToCartFollowUp(ConfirmationState.PendingAction pending) {
@@ -808,10 +848,12 @@ public class GroqService {
     }
 
     // ══════════════════════════════════════════════════════════════
-    //  RESPONSE RECORD
+    // RESPONSE RECORD
     // ══════════════════════════════════════════════════════════════
 
     public record ChatResponse(String message, String paymentUrl, Long orderCode) {
-        public ChatResponse(String message) { this(message, null, null); }
+        public ChatResponse(String message) {
+            this(message, null, null);
+        }
     }
 }

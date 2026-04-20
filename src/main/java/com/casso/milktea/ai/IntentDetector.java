@@ -1,163 +1,248 @@
 package com.casso.milktea.ai;
 
 import com.casso.milktea.model.Customer;
-import lombok.RequiredArgsConstructor;
 import org.springframework.stereotype.Component;
 
-import java.util.regex.Pattern;
-
 /**
- * Fast-path intent detector — runs BEFORE Gemini for high-confidence intents.
+ * Fast-path intent detector — simple string matching, no regex, no Unicode issues.
  *
- * Solves the problem where Gemini misinterprets simple, unambiguous requests
- * like "menu", "gio hang", "thanh toan" as find_item_by_name queries.
+ * Runs BEFORE Gemini for high-confidence intents so that:
+ * - "menu", "xem menu", "thực đơn" → get_menu() directly
+ * - "giỏ hàng", "bill", "xem đơn" → view_cart() directly
+ * - "thanh toán" → checkout flow directly
  *
- * IntentDetector returns a ToolRequest for simple intents, null for everything else
- * (which then goes to Gemini for complex reasoning).
+ * No regex — plain contains() and equals() on lowercase strings.
+ * This avoids Unicode/encoding bugs that plague regex on Windows.
  */
 @Component
-@RequiredArgsConstructor
 public class IntentDetector {
-
-    // ── Intent patterns (order matters — more specific first) ───
-
-    // MENU intents
-    private static final Pattern PAT_MENU = Pattern.compile(
-            "(?i)^\\s*(menu|thuc\\s*don|danh\\s*sach\\s*mon|xem\\s*menu|xem\\s*thuc\\s*don|xem\\s*danh\\s*sach|lIST\\s*mon)\\s*$"
-    );
-    private static final Pattern PAT_MENU_CAT = Pattern.compile(
-            "(?i)^\\s*(menu|thuc\\s*don)\\s+(.+)$"
-    );
-
-    // CART intents
-    private static final Pattern PAT_VIEW_CART = Pattern.compile(
-            "(?i)^\\s*(gio\\s*hang|gio\\s*hàng|cart|bill|hoa\\s*don|xem\\s*gio|xem\\s*cart|xem\\s*đơn|xem\\s*don|kiểm\\s*tra\\s*gio|check\\s*cart|view\\s*cart)\\s*$"
-    );
-    private static final Pattern PAT_CLEAR_CART = Pattern.compile(
-            "(?i)^\\s*(xóa\\s*gio|xóa\\s*hết|bỏ\\s*gio|hủy\\s*gio|clear\\s*cart|reset\\s*cart)\\s*$"
-    );
-
-    // BEST SELLER
-    private static final Pattern PAT_BEST_SELLER = Pattern.compile(
-            "(?i)^\\s*(bán\\s*chạy|best\\s*seller|hot|nổi\\s*bật|top\\s*mon|menu\\s*hot)\\s*$"
-    );
-    private static final Pattern PAT_BEST_SELLER_CAT = Pattern.compile(
-            "(?i)^\\s*(bán\\s*chạy|best\\s*seller)\\s+(.+)$"
-    );
-
-    // CHECKOUT / PAYMENT
-    private static final Pattern PAT_CHECKOUT = Pattern.compile(
-            "(?i)^\\s*(thanh\\s*toán|thanh\\s*toan|checkout|pay|qr|chốt\\s*đơn|đặt\\s*đơn|payment)\\s*$"
-    );
-
-    // GREETING (also handled in GroqService but IntentDetector catches it first)
-    private static final Pattern PAT_GREETING = Pattern.compile(
-            "(?i)^\\s*(xin\\s*chao|chào|hello|hi\\b|hey|good\\s*morning|good\\s*afternoon|buổi\\s*sáng|buổi\\s*trưa|buổi\\s*chiều)\\s*$"
-    );
-
-    // HELP / QUESTION about ordering
-    private static final Pattern PAT_HELP = Pattern.compile(
-            "(?i)^\\s*(mẹ\\s*ơi|mame|help|giúp\\s*mẹ|bạn\\s*là\\s*ai|bạn\\s*là\\s*gì)\\s*$"
-    );
-
-    // YES/NO confirmation patterns
-    private static final Pattern PAT_YES = Pattern.compile(
-            "(?i)^\\s*(đúng|rồi|ok|okay|yes|yep|yeah|đồng\\s*ý|có\\s*đúng|vâng|dạ|được|ừ|ừm|uhu|u\\b)\\s*$"
-    );
-    private static final Pattern PAT_NO = Pattern.compile(
-            "(?i)^\\s*(không|sai|sai\\s*rồi|no|nope|nope\\b|không\\s*đúng|thôi|bỏ|k\\s*bỏ)\\s*$"
-    );
-
-    // Size changes
-    private static final Pattern PAT_CHANGE_SIZE = Pattern.compile(
-            "(?i)^\\s*(size\\s*[MLml]|lớn|nhỏ|đổi\\s*size|đổi\\s*sang)\\s*$"
-    );
 
     /**
      * Detect intent from user message.
-     * Returns a detected intent, or null if needs Gemini reasoning.
+     * Returns a DetectedIntent for fast-path handling, or null for Gemini reasoning.
      */
     public DetectedIntent detect(String userMessage, Customer customer) {
         if (userMessage == null || userMessage.isBlank()) {
             return null;
         }
+
         String msg = userMessage.trim();
+        String lower = msg.toLowerCase();
+
+        // ── Exact / simple matches (no regex needed) ─────────────
 
         // GREETING
-        if (PAT_GREETING.matcher(msg).matches()) {
+        if (isGreeting(lower)) {
             return DetectedIntent.greeting();
         }
 
         // HELP
-        if (PAT_HELP.matcher(msg).matches()) {
+        if (lower.equals("mẹ ơi") || lower.equals("mame") || lower.equals("help")
+                || lower.equals("giúp mẹ") || lower.equals("bạn là ai")
+                || lower.startsWith("bạn là") || lower.startsWith("mẹ là")) {
             return DetectedIntent.help();
         }
 
-        // MENU — full menu
-        if (PAT_MENU.matcher(msg).matches()) {
-            return DetectedIntent.menu(null);
-        }
-
-        // MENU — with category
-        var menuCatMatcher = PAT_MENU_CAT.matcher(msg);
-        if (menuCatMatcher.matches()) {
-            String category = menuCatMatcher.group(2).trim();
+        // MENU — many ways to say it
+        if (isMenuRequest(lower, msg)) {
+            String category = extractCategoryAfterKeyword(lower, msg, "menu", "thực đơn", "danh sách món");
             return DetectedIntent.menu(category);
         }
 
-        // BEST SELLER — no category
-        if (PAT_BEST_SELLER.matcher(msg).matches()) {
-            return DetectedIntent.bestSellers(null);
-        }
-
-        // BEST SELLER — with category
-        var bsMatcher = PAT_BEST_SELLER_CAT.matcher(msg);
-        if (bsMatcher.matches()) {
-            String category = bsMatcher.group(2).trim();
-            return DetectedIntent.bestSellers(category);
-        }
-
-        // VIEW CART
-        if (PAT_VIEW_CART.matcher(msg).matches()) {
+        // VIEW CART — many ways to say it
+        if (isCartViewRequest(lower, msg)) {
             return DetectedIntent.viewCart();
         }
 
         // CLEAR CART
-        if (PAT_CLEAR_CART.matcher(msg).matches()) {
+        if (lower.equals("xóa giỏ") || lower.equals("bỏ giỏ") || lower.equals("hủy giỏ")
+                || lower.equals("xóa hết") || lower.equals("bỏ hết") || lower.equals("clear cart")
+                || lower.equals("reset cart") || lower.equals("xóa đơn") || lower.equals("hủy đơn")) {
             return DetectedIntent.clearCart();
         }
 
-        // CHECKOUT
-        if (PAT_CHECKOUT.matcher(msg).matches()) {
+        // BEST SELLER
+        if (isBestSellerRequest(lower, msg)) {
+            String category = extractCategoryAfterKeyword(lower, msg, "bán chạy", "best seller", "hot");
+            return DetectedIntent.bestSellers(category);
+        }
+
+        // CHECKOUT / PAYMENT
+        if (lower.equals("thanh toán") || lower.equals("thanh toan") || lower.equals("checkout")
+                || lower.equals("pay") || lower.equals("payment") || lower.equals("qr")
+                || lower.equals("chốt đơn") || lower.equals("đặt đơn")
+                || lower.equals("thanh toán đi") || lower.equals("thanh toán nha")
+                || lower.equals("thanh toán đi mẹ") || lower.equals("thanh toán luôn")
+                || lower.startsWith("thanh toán")) {
             return DetectedIntent.checkout();
         }
 
-        // Size-only response (e.g., "L", "lớn", "size M")
-        if (PAT_CHANGE_SIZE.matcher(msg).matches()) {
+        // SIZE-ONLY responses
+        if (isSizeOnly(lower)) {
             return DetectedIntent.sizeOnly(msg);
         }
 
-        // YES — user confirms something
-        if (PAT_YES.matcher(msg).matches()) {
+        // YES / NO confirmations
+        if (isAffirm(lower)) {
             return DetectedIntent.affirm();
         }
-
-        // NO — user rejects or changes mind
-        if (PAT_NO.matcher(msg).matches()) {
+        if (isNegate(lower)) {
             return DetectedIntent.negate();
         }
 
-        // Unknown — let Gemini handle it
+        // No match — let Gemini handle it (find_item_by_name, etc.)
         return null;
     }
 
+    // ── Simple predicate methods (no regex) ───────────────────────
+
+    private boolean isGreeting(String lower) {
+        return lower.equals("xin chào") || lower.equals("chào") || lower.equals("chào bạn")
+                || lower.equals("chào mẹ") || lower.equals("hello") || lower.equals("hi")
+                || lower.equals("hey") || lower.equals("helo")
+                || lower.equals("good morning") || lower.equals("good afternoon")
+                || lower.equals("good evening")
+                || lower.equals("buổi sáng") || lower.equals("buổi trưa") || lower.equals("buổi chiều")
+                || lower.matches("^hi\\b.*") || lower.matches("^hey.*")
+                || lower.matches(".*\\bhi\\b.*") || lower.matches(".*\\bhey\\b.*");
+    }
+
+    private boolean isMenuRequest(String lower, String original) {
+        // Exact matches
+        if (lower.equals("menu") || lower.equals("thực đơn") || lower.equals("thuc don")
+                || lower.equals("danh sach mon") || lower.equals("danh sách món")
+                || lower.equals("list món") || lower.equals("list mon")) {
+            return true;
+        }
+        // Starts with keywords
+        if (lower.startsWith("xem menu") || lower.startsWith("xem thực đơn")
+                || lower.startsWith("xem thuc don") || lower.startsWith("xem danh sách")
+                || lower.startsWith("xem danh sach") || lower.startsWith("menu ")) {
+            return true;
+        }
+        // Contains menu keyword (standalone word)
+        String[] words = lower.split("\\s+");
+        for (String w : words) {
+            if (w.equals("menu") || w.equals("thực") || w.equals("thuc")
+                    || w.equals("đơn") || w.equals("don")) {
+                return true;
+            }
+        }
+        return false;
+    }
+
+    private boolean isCartViewRequest(String lower, String original) {
+        if (lower.equals("giỏ hàng") || lower.equals("gio hang") || lower.equals("cart")
+                || lower.equals("bill") || lower.equals("hóa đơn") || lower.equals("hoa don")
+                || lower.equals("xem giỏ") || lower.equals("xem gio") || lower.equals("xem cart")
+                || lower.equals("xem đơn") || lower.equals("xem don") || lower.equals("xem bill")
+                || lower.equals("view cart") || lower.equals("check cart")
+                || lower.equals("giỏ") || lower.equals("gio") || lower.equals("đơn") || lower.equals("don")) {
+            return true;
+        }
+        // "giỏ hàng của tôi", "xem đơn của mình", etc.
+        if ((lower.contains("giỏ") || lower.contains("gio") || lower.contains("đơn") || lower.contains("don")
+                || lower.contains("bill") || lower.contains("cart"))
+                && (lower.contains("tôi") || lower.contains("mình") || lower.contains("của")
+                    || lower.startsWith("giỏ") || lower.startsWith("gio")
+                    || lower.startsWith("xem"))) {
+            return true;
+        }
+        return false;
+    }
+
+    private boolean isBestSellerRequest(String lower, String original) {
+        if (lower.equals("bán chạy") || lower.equals("ban chay")
+                || lower.equals("best seller") || lower.equals("hot")
+                || lower.equals("nổi bật") || lower.equals("noi bat")
+                || lower.equals("top món") || lower.equals("top mon")
+                || lower.equals("menu hot") || lower.equals("món hot")) {
+            return true;
+        }
+        if (lower.startsWith("bán chạy") || lower.startsWith("best seller")
+                || lower.startsWith("bán chạy")) {
+            return true;
+        }
+        return false;
+    }
+
+    private boolean isSizeOnly(String lower) {
+        // Single word size responses
+        if (lower.equals("m") || lower.equals("l") || lower.equals("size m") || lower.equals("size l")
+                || lower.equals("size m)")) {  // handles "size M)"
+            return true;
+        }
+        // "lớn" = L, "nhỏ" = M
+        if (lower.equals("lớn") || lower.equals("lon") || lower.equals("lả")) {
+            return true;
+        }
+        if (lower.equals("nhỏ") || lower.equals("nho") || lower.equals("vừa") || lower.equals("vua")) {
+            return true;
+        }
+        return false;
+    }
+
+    private boolean isAffirm(String lower) {
+        return lower.equals("đúng") || lower.equals("dung") || lower.equals("rồi") || lower.equals("roi")
+                || lower.equals("ok") || lower.equals("okay") || lower.equals("oke") || lower.equals("ỏk")
+                || lower.equals("yes") || lower.equals("yep") || lower.equals("yeah") || lower.equals("ya")
+                || lower.equals("đồng ý") || lower.equals("dong y") || lower.equals("có đúng")
+                || lower.equals("có") || lower.equals("co")
+                || lower.equals("vâng") || lower.equals("vang") || lower.equals("dạ") || lower.equals("da")
+                || lower.equals("được") || lower.equals("duoc") || lower.equals("ừ") || lower.equals("u")
+                || lower.equals("ừm") || lower.equals("um") || lower.equals("uhu") || lower.equals("u hu")
+                || lower.matches("^đúng rồi$") || lower.matches(".*ok.*")
+                || lower.matches(".*được$") || lower.matches(".*vâng$");
+    }
+
+    private boolean isNegate(String lower) {
+        return lower.equals("không") || lower.equals("khong") || lower.equals("sai")
+                || lower.equals("sai rồi") || lower.equals("no") || lower.equals("nope")
+                || lower.equals("không đúng") || lower.equals("thôi") || lower.equals("bỏ")
+                || lower.equals("không cần") || lower.equals("khong can")
+                || lower.matches(".*không.*");
+    }
+
     /**
-     * Detected intent result.
-     * Can represent:
-     * - A tool to call directly (FAST PATH)
-     * - A non-tool intent (greeting, help, yes/no)
-     * - A request to use Gemini (type = COMPLEX)
+     * Extract category after a keyword like "menu", "thực đơn", etc.
+     * e.g. "menu tra sua" → "Tra Sua"
      */
+    private String extractCategoryAfterKeyword(String lower, String original,
+            String... keywords) {
+        for (String kw : keywords) {
+            if (lower.startsWith(kw + " ") || lower.contains(kw + " ")) {
+                int idx = lower.indexOf(kw + " ");
+                String after = original.substring(idx + kw.length()).trim();
+                if (!after.isEmpty()) {
+                    // Capitalize properly
+                    return capitalizeCategory(after);
+                }
+            }
+        }
+        return null;
+    }
+
+    private String capitalizeCategory(String s) {
+        if (s == null || s.isEmpty()) return s;
+        String[] validCategories = {
+                "Trà Sữa", "Trà Sữa", "Trà Trái Cây", "Trà Trái Cây",
+                "Cà Phê", "Cà Phê", "Cà Phê", "Cà Phê",
+                "Đá Xay", "Đá Xay",
+                "Topping", "Topping"
+        };
+        String lower = s.toLowerCase();
+        if (lower.equals("trà sữa") || lower.equals("tra sua") || lower.equals("trasua")) return "Trà Sữa";
+        if (lower.equals("trà trái cây") || lower.equals("tra trai cay") || lower.equals("tratraicay")) return "Trà Trái Cây";
+        if (lower.equals("cà phê") || lower.equals("ca phe") || lower.equals("caphe") || lower.equals("càfe")) return "Cà Phê";
+        if (lower.equals("đá xay") || lower.equals("da xay") || lower.equals("daxay")) return "Đá Xay";
+        if (lower.equals("topping") || lower.equals("toppings")) return "Topping";
+        return s;
+    }
+
+    // ══════════════════════════════════════════════════════════════
+    // DetectedIntent — result type
+    // ══════════════════════════════════════════════════════════════
+
     public static class DetectedIntent {
         public enum Type {
             // Tool calls — handled without Gemini
@@ -213,17 +298,6 @@ public class IntentDetector {
             return type == Type.MENU || type == Type.VIEW_CART
                     || type == Type.CLEAR_CART || type == Type.BEST_SELLERS
                     || type == Type.CHECKOUT;
-        }
-
-        public String toolName() {
-            return switch (type) {
-                case MENU -> "get_menu";
-                case VIEW_CART -> "view_cart";
-                case CLEAR_CART -> "clear_cart";
-                case BEST_SELLERS -> "get_best_sellers";
-                case CHECKOUT -> "checkout";
-                default -> null;
-            };
         }
     }
 }
