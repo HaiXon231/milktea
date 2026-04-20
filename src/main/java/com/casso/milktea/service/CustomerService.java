@@ -5,6 +5,7 @@ import com.casso.milktea.model.Customer;
 import com.casso.milktea.repository.ConversationMessageRepository;
 import com.casso.milktea.repository.CustomerRepository;
 import lombok.RequiredArgsConstructor;
+import org.springframework.data.domain.Pageable;
 import org.springframework.stereotype.Service;
 import org.springframework.transaction.annotation.Transactional;
 
@@ -49,9 +50,13 @@ public class CustomerService {
      * Get the last N messages for AI context (returned in chronological order).
      */
     public List<ConversationMessage> getRecentMessages(Customer customer) {
+        return getRecentMessages(customer, 10);
+    }
+
+    public List<ConversationMessage> getRecentMessages(Customer customer, int limit) {
         List<ConversationMessage> messages =
-                conversationMessageRepository.findTop20ByCustomerIdOrderByCreatedAtDesc(customer.getId());
-        // Reverse to chronological order
+                conversationMessageRepository.findTopNByCustomerIdOrderByCreatedAtDesc(
+                        customer.getId(), Pageable.ofSize(limit));
         return messages.reversed();
     }
 }

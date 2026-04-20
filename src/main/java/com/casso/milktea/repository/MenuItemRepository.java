@@ -7,4 +7,8 @@ import java.util.List;
 public interface MenuItemRepository extends JpaRepository<MenuItem, String> {
     List<MenuItem> findByCategoryAndAvailableTrue(String category);
     List<MenuItem> findByAvailableTrue();
+
+    List<MenuItem> findTop10ByAvailableTrueOrderBySalesCountDesc();
+
+    List<MenuItem> findByCategoryAndAvailableTrueOrderBySalesCountDesc(String category);
 }

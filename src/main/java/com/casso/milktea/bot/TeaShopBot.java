@@ -23,6 +23,7 @@ public class TeaShopBot {
     private final AiChatService aiChatService;
 
     @PostConstruct
+    @SuppressWarnings("deprecation")
     public void start() {
         log.info("🤖 Starting Telegram bot...");
 
@@ -42,7 +43,8 @@ public class TeaShopBot {
 
     private void handleUpdate(Update update) {
         Message message = update.message();
-        if (message == null) return;
+        if (message == null)
+            return;
 
         Long chatId = message.chat().id();
         String text = message.text();
@@ -65,9 +67,10 @@ public class TeaShopBot {
         // Send response
         sendMessage(chatId, result.message());
 
-        // If there's a payment URL, send it separately
+        // If there's a payment URL, send it separately with better formatting
         if (result.paymentUrl() != null) {
-            sendMessage(chatId, "🔗 Link thanh toán: " + result.paymentUrl());
+            String paymentMessage = "💳 Link thanh toán (QR Code):\n" + result.paymentUrl();
+            sendMessage(chatId, paymentMessage);
         }
     }
 
@@ -83,10 +86,17 @@ public class TeaShopBot {
      * Send payment success notification to a customer.
      */
     public void notifyPaymentSuccess(Long chatId, long orderCode) {
-        String message = String.format(
-                "✅ Đã nhận thanh toán đơn hàng #%d!\n\n" +
-                "Mẹ đang làm món cho con nha. Chờ chút xíu thôi! 🧋❤️",
-                orderCode);
-        sendMessage(chatId, message);
+        log.info("📱 [NOTIFY] Sending payment success to chat {}, order {}", chatId, orderCode);
+        try {
+            String message = String.format(
+                    "✅ Đã nhận thanh toán đơn hàng #%d!\n\n" +
+                            "Mẹ đang làm món cho con nha. Chờ chút xíu thôi! 🧋❤️",
+                    orderCode);
+            sendMessage(chatId, message);
+            log.info("✅ [NOTIFY] Success notification sent to chat {}", chatId);
+        } catch (Exception e) {
+            log.error("❌ [NOTIFY] Failed to send success notification to chat {}: {}", chatId, e.getMessage(), e);
+            throw new RuntimeException("Failed to notify customer", e);
+        }
     }
 }

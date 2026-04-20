@@ -1,0 +1,28 @@
+1. Luồng Chat bình thường (Chính xác 99%)
+Người dùng nhắn tin lên Telegram.
+Telegram đẩy tin nhắn về Backend (BE).
+BE gom tin nhắn + ngữ cảnh giỏ hàng + danh sách các hàm (Tools) gửi lên Groq.
+Groq phân tích và nhận ra cần gọi hàm (VD: add_to_cart).
+Groq báo về BE: "Ê, chạy giùm tao hàm add_to_cart với tham số này".
+BE chạy hàm Java add_to_cart().
+[CHỖ NÀY BẠN THIẾU 1 NHỊP]: BE lấy kết quả của hàm (VD: "Đã thêm thành công") gửi ngược lại lên Groq 1 lần nữa.
+Groq đọc kết quả đó, tự xào nấu thành câu chữ tự nhiên: "Mẹ thêm món vào giỏ cho con rồi nha!" và trả về BE.
+BE lấy câu này gửi cho Telegram.
+👉 Chính vì nó phải đi 2 vòng (BE -> Groq -> BE chạy hàm -> Groq -> BE) nên đôi khi nó hơi chậm.
+
+2. Luồng Thanh Toán (PayOS)
+Chỗ này bạn bị nhầm lẫn một chút giữa "API trả kết quả trực tiếp" và "Webhook". Nó hoạt động như sau:
+
+Giai đoạn 2.1: Tạo Link thanh toán (Không dùng Webhook)
+
+Khi khách kêu "tính tiền", Groq gọi hàm checkout().
+BE chạy hàm checkout(), gọi trực tiếp sang API của PayOS (lệnh createPaymentLink()).
+PayOS trả về ngay lập tức Link chứa QR Code (phản hồi API thông thường, không qua webhook).
+BE lấy Link này gửi cho Telegram để khách mở ra quét.
+Giai đoạn 2.2: Xác nhận khách đã chuyển khoản xong (Dùng Webhook)
+
+Khách hàng bật app ngân hàng lên, quét mã QR và bấm chuyển khoản.
+Tiền vào tài khoản thật của bạn. Lúc này PayOS mới nhận ra là có tiền vào.
+PayOS lập tức chủ động gọi vào đường dẫn Webhook của BE (/api/webhook/payos) để báo cáo: "Ê có thằng vừa chuyển khoản đơn hàng số #123 thành công nè".
+BE (File PaymentWebhookController.java) nhận thông báo này, tra trong Database xem đơn #123 của ông khách nào.
+BE tự động đẩy tin nhắn thẳng lên Telegram: "Đã nhận thanh toán thành công!" (Hoàn toàn không cần Groq xen vào bước này).

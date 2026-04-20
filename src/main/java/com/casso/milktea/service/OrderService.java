@@ -27,19 +27,27 @@ public class OrderService {
     private String appBaseUrl;
 
     /**
-     * Create an order from the customer's cart and generate a payOS payment link.
+     * Chốt đơn hàng + tạo link thanh toán payOS QR.
+     *
+     * @param name    Tên người nhận
+     * @param phone    SĐT người nhận
+     * @param address  Địa chỉ giao hàng
+     * @param note     Ghi chú (tuỳ chọn)
      */
     @Transactional
-    public OrderResult checkout(Customer customer, String note) {
+    public OrderResult checkout(Customer customer, String name, String phone,
+            String address, String note) {
         List<CartItem> cartItems = cartService.getCartItems(customer);
 
         if (cartItems.isEmpty()) {
-            return new OrderResult(false, "Giỏ hàng trống! Hãy thêm món trước khi thanh toán.", null, null);
+            return new OrderResult(false,
+                    "Giỏ hàng trống rồi con ơi! Thêm món vào giỏ trước nha 😊",
+                    null, null);
         }
 
         int totalAmount = cartService.calculateTotal(cartItems);
 
-        // Generate unique order code (timestamp-based)
+        // Generate unique order code
         long orderCode = System.currentTimeMillis() / 1000;
 
         // Create order
@@ -48,6 +56,9 @@ public class OrderService {
                 .customer(customer)
                 .totalAmount(totalAmount)
                 .status(OrderStatus.AWAITING_PAYMENT)
+                .deliveryName(name)
+                .deliveryPhone(phone)
+                .deliveryAddress(address)
                 .note(note)
                 .build();
 
@@ -64,6 +75,11 @@ public class OrderService {
             order.getItems().add(orderItem);
         }
 
+        // Build description for payOS
+        int itemCount = cartItems.stream()
+                .mapToInt(com.casso.milktea.model.CartItem::getQuantity)
+                .sum();
+
         // Create payOS payment link
         try {
             List<PaymentLinkItem> payosItems = cartItems.stream()
@@ -77,7 +93,7 @@ public class OrderService {
             CreatePaymentLinkRequest request = CreatePaymentLinkRequest.builder()
                     .orderCode(orderCode)
                     .amount((long) totalAmount)
-                    .description("Don hang #" + orderCode)
+                    .description("Casso #" + orderCode + " (" + itemCount + " món)")
                     .returnUrl(appBaseUrl + "/payment/success")
                     .cancelUrl(appBaseUrl + "/payment/cancel")
                     .items(payosItems)
@@ -88,39 +104,44 @@ public class OrderService {
             order.setPaymentUrl(response.getCheckoutUrl());
             orderRepository.save(order);
 
-            // Clear the cart
+            // Clear the cart after successful order creation
             cartService.clearCart(customer);
 
-            // Build response
+            // Build order summary
             StringBuilder sb = new StringBuilder();
-            sb.append("📋 ĐƠN HÀNG #").append(orderCode).append("\n\n");
+            sb.append("📋 ĐƠN HÀNG #").append(orderCode).append("\n");
+            sb.append("👤 Người nhận: ").append(name).append("\n");
+            sb.append("📞 SĐT: ").append(phone).append("\n");
+            sb.append("📍 Địa chỉ: ").append(address).append("\n\n");
             for (OrderItem item : order.getItems()) {
                 sb.append(String.format("• %dx %s (size %s) - %,dđ\n",
                         item.getQuantity(), item.getItemName(),
                         item.getSize(), item.getSubtotal()));
             }
             sb.append(String.format("\n💰 Tổng cộng: %,dđ\n", totalAmount));
-            sb.append("\n💳 Thanh toán tại link bên dưới:");
+            sb.append("\n💳 Thanh toán QR tại link bên dưới nha con!");
 
             return new OrderResult(true, sb.toString(), response.getCheckoutUrl(), orderCode);
 
         } catch (Exception e) {
             log.error("Failed to create payOS payment link for order {}", orderCode, e);
+            // Still save order so it can be retried
             order.setStatus(OrderStatus.PENDING);
             orderRepository.save(order);
             cartService.clearCart(customer);
             return new OrderResult(false,
-                    "Đã tạo đơn hàng #" + orderCode + " nhưng lỗi tạo link thanh toán. Vui lòng liên hệ quán.",
+                    "Tạo đơn #" + orderCode + " thành công nhưng chưa tạo được link thanh toán. "
+                            + "Con nhắn lại 'thanh toán' để mẹ gửi lại link nha!",
                     null, orderCode);
         }
     }
 
     /**
-     * Confirm payment via webhook.
+     * Confirm payment via payOS webhook.
      */
     @Transactional
     public Order confirmPayment(long orderCode) {
-        Order order = orderRepository.findByOrderCode(orderCode)
+        Order order = orderRepository.findByOrderCodeWithCustomer(orderCode)
                 .orElseThrow(() -> new RuntimeException("Order not found: " + orderCode));
 
         if (order.getStatus() == OrderStatus.PAID) {
@@ -135,5 +156,10 @@ public class OrderService {
     /**
      * Result record for checkout operation.
      */
-    public record OrderResult(boolean success, String message, String paymentUrl, Long orderCode) {}
+    public record OrderResult(boolean success, String message, String paymentUrl, Long orderCode) {
+
+        public String toToolResult() {
+            return message;
+        }
+    }
 }

@@ -28,42 +28,54 @@ public class PaymentWebhookController {
      */
     @PostMapping("/payos")
     public ResponseEntity<Map<String, String>> handlePayosWebhook(@RequestBody Object webhookBody) {
-        log.info("📩 Received payOS webhook");
+        log.info("📩 [WEBHOOK] Received payOS webhook request");
+        log.debug("🔍 [WEBHOOK] Webhook body: {}", webhookBody);
 
         try {
-            // Verify HMAC-SHA256 signature and extract data
             WebhookData data = payOS.webhooks().verify(webhookBody);
+            log.info("✅ [WEBHOOK] HMAC verification passed");
 
             long orderCode = data.getOrderCode();
             String code = data.getCode();
+            log.info("📋 [WEBHOOK] order_code={}, code={}, status_description={}",
+                    orderCode, code, data.getDesc());
 
-            log.info("Webhook verified - orderCode: {}, code: {}", orderCode, code);
-
-            // code "00" means payment success
             if ("00".equals(code)) {
-                Order order = orderService.confirmPayment(orderCode);
-                log.info("✅ Order {} confirmed as PAID", orderCode);
+                log.info("💰 [WEBHOOK] Payment confirmed! Processing order {}", orderCode);
 
-                // Notify customer via Telegram
-                teaShopBot.notifyPaymentSuccess(
-                        order.getCustomer().getTelegramChatId(),
-                        orderCode);
+                Order order = orderService.confirmPayment(orderCode);
+                log.info("✅ [WEBHOOK] Order {} status updated to PAID", orderCode);
+
+                if (order.getCustomer() != null) {
+                    Long chatId = order.getCustomer().getTelegramChatId();
+                    log.info("📲 [WEBHOOK] Sending Telegram notification to chat {}", chatId);
+
+                    try {
+                        teaShopBot.notifyPaymentSuccess(chatId, orderCode);
+                        log.info("✅ [WEBHOOK] Telegram notification sent successfully");
+                    } catch (Exception notifyEx) {
+                        log.error("❌ [WEBHOOK] Failed to send Telegram notification: {}", notifyEx.getMessage(),
+                                notifyEx);
+                    }
+                } else {
+                    log.error("❌ [WEBHOOK] Order customer is null for order {}", orderCode);
+                }
+            } else {
+                log.warn("⚠️ [WEBHOOK] Payment not confirmed (code={}), skipping notification", code);
             }
 
+            log.info("✅ [WEBHOOK] Successfully processed webhook");
             return ResponseEntity.ok(Map.of("status", "OK"));
 
         } catch (Exception e) {
-            log.error("❌ Webhook verification failed", e);
-            return ResponseEntity.badRequest()
-                    .body(Map.of("status", "ERROR", "message", "Invalid webhook signature"));
+            log.error("❌ [WEBHOOK] Webhook verification/processing failed", e);
+            log.error("❌ [WEBHOOK] Error type: {}, Message: {}", e.getClass().getSimpleName(), e.getMessage());
+
+            return ResponseEntity.ok(Map.of(
+                    "status", "ERROR",
+                    "message", "Error: " + e.getMessage(),
+                    "note", "Logged for investigation"));
         }
     }
 
-    /**
-     * Health check endpoint for payOS webhook URL verification.
-     */
-    @GetMapping("/payos")
-    public ResponseEntity<Map<String, String>> webhookHealthCheck() {
-        return ResponseEntity.ok(Map.of("status", "OK", "service", "casso-milktea-bot"));
-    }
 }
