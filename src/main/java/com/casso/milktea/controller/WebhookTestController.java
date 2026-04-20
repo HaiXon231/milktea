@@ -8,6 +8,7 @@ import lombok.extern.slf4j.Slf4j;
 import org.springframework.http.ResponseEntity;
 import org.springframework.web.bind.annotation.*;
 
+import java.util.List;
 import java.util.Map;
 
 /**
@@ -32,12 +33,12 @@ public class WebhookTestController {
      */
     @GetMapping("/test-notify/{orderCode}")
     public ResponseEntity<Map<String, Object>> testNotify(@PathVariable Long orderCode) {
-        log.info("🧪 [TEST] test-notify called for order {}", orderCode);
+        log.info("[TEST] test-notify called for order {}", orderCode);
 
         Order order = orderRepository.findByOrderCodeWithCustomer(orderCode).orElse(null);
 
         if (order == null) {
-            log.warn("🧪 [TEST] Order {} not found in DB", orderCode);
+            log.warn("[TEST] Order {} not found in DB", orderCode);
             return ResponseEntity.badRequest().body(Map.of(
                     "error", "Order not found",
                     "orderCode", orderCode,
@@ -45,7 +46,7 @@ public class WebhookTestController {
         }
 
         if (order.getCustomer() == null) {
-            log.error("🧪 [TEST] Order {} has null customer!", orderCode);
+            log.error("[TEST] Order {} has null customer!", orderCode);
             return ResponseEntity.badRequest().body(Map.of(
                     "error", "Order has no customer",
                     "orderCode", orderCode,
@@ -54,12 +55,12 @@ public class WebhookTestController {
         }
 
         Long chatId = order.getCustomer().getTelegramChatId();
-        log.info("🧪 [TEST] Order {} → customer {} → chatId {}",
+        log.info("[TEST] Order {} -> customer {} -> chatId {}",
                 orderCode, order.getCustomer().getId(), chatId);
 
         try {
             teaShopBot.notifyPaymentSuccess(chatId, orderCode);
-            log.info("🧪 [TEST] Telegram notification sent OK to chatId={}", chatId);
+            log.info("[TEST] Telegram notification sent OK to chatId={}", chatId);
             return ResponseEntity.ok(Map.of(
                     "success", true,
                     "orderCode", orderCode,
@@ -67,7 +68,7 @@ public class WebhookTestController {
                     "customerId", order.getCustomer().getId(),
                     "message", "Telegram notification sent! Check Telegram."));
         } catch (Exception e) {
-            log.error("🧪 [TEST] Telegram notification failed: {}", e.getMessage(), e);
+            log.error("[TEST] Telegram notification failed: {}", e.getMessage(), e);
             return ResponseEntity.internalServerError().body(Map.of(
                     "success", false,
                     "orderCode", orderCode,
@@ -78,7 +79,7 @@ public class WebhookTestController {
     }
 
     /**
-     * List recent orders for a chatId — helps debug if orders are being created.
+     * List recent orders for a chatId -- helps debug if orders are being created.
      *
      * Example: GET /api/admin/orders?chatId=123456789
      */
@@ -87,27 +88,23 @@ public class WebhookTestController {
             @RequestParam Long chatId,
             @RequestParam(defaultValue = "10") int limit) {
 
-        log.info("🧪 [TEST] listing orders for chatId={}, limit={}", chatId, limit);
+        log.info("[TEST] listing orders for chatId={}, limit={}", chatId, limit);
 
-        return orderRepository.findByCustomerIdOrderByCreatedAtDesc(chatId, limit > 50 ? 50 : limit)
-                .map(orders -> {
-                    var orderSummaries = orders.stream()
-                            .map(o -> Map.of(
-                                    "orderCode", o.getOrderCode(),
-                                    "status", o.getStatus().name(),
-                                    "total", o.getTotalAmount(),
-                                    "deliveryName", o.getDeliveryName() != null ? o.getDeliveryName() : "null",
-                                    "paymentUrl", o.getPaymentUrl() != null ? "yes" : "no"))
-                            .toList();
-                    return ResponseEntity.ok(Map.of(
-                            "count", orders.size(),
-                            "chatId", chatId,
-                            "orders", orderSummaries));
-                })
-                .orElse(ResponseEntity.ok(Map.of(
-                        "count", 0,
-                        "chatId", chatId,
-                        "orders", java.util.List.of()));
+        int safeLimit = limit > 0 && limit <= 50 ? limit : 20;
+        List<Order> orders = orderRepository.findTop20ByCustomerIdOrderByCreatedAtDesc(chatId);
+        var orderSummaries = orders.stream()
+                .limit(safeLimit)
+                .map(o -> Map.of(
+                        "orderCode", o.getOrderCode(),
+                        "status", o.getStatus().name(),
+                        "total", o.getTotalAmount(),
+                        "deliveryName", o.getDeliveryName() != null ? o.getDeliveryName() : "null",
+                        "paymentUrl", o.getPaymentUrl() != null ? "yes" : "no"))
+                .toList();
+        return ResponseEntity.ok(Map.of(
+                "count", orderSummaries.size(),
+                "chatId", chatId,
+                "orders", orderSummaries));
     }
 
     /**
@@ -117,41 +114,43 @@ public class WebhookTestController {
      * Example: POST /api/admin/confirm-payment/123456
      */
     @PostMapping("/confirm-payment/{orderCode}")
-    public ResponseEntity<Map<String, Object>> confirmPayment(@PathVariable Long orderCode) {
-        log.info("🧪 [TEST] Manual confirm-payment called for order {}", orderCode);
+    public ResponseEntity<?> confirmPayment(@PathVariable Long orderCode) {
+        log.info("[TEST] Manual confirm-payment called for order {}", orderCode);
 
-        return orderRepository.findByOrderCodeWithCustomer(orderCode)
-                .map(order -> {
-                    if (order.getStatus() == com.casso.milktea.model.OrderStatus.PAID) {
-                        return ResponseEntity.ok(Map.of(
-                                "already", true,
-                                "orderCode", orderCode,
-                                "status", "PAID"));
-                    }
+        Order order = orderRepository.findByOrderCodeWithCustomer(orderCode).orElse(null);
 
-                    order.setStatus(com.casso.milktea.model.OrderStatus.PAID);
-                    orderRepository.save(order);
+        if (order == null) {
+            return ResponseEntity.ok(Map.of(
+                    "error", "Order not found",
+                    "orderCode", orderCode));
+        }
 
-                    Long chatId = order.getCustomer() != null
-                            ? order.getCustomer().getTelegramChatId() : null;
+        if (order.getStatus() == com.casso.milktea.model.OrderStatus.PAID) {
+            return ResponseEntity.ok(Map.of(
+                    "already", true,
+                    "orderCode", orderCode,
+                    "status", "PAID"));
+        }
 
-                    if (chatId != null) {
-                        try {
-                            teaShopBot.notifyPaymentSuccess(chatId, orderCode);
-                        } catch (Exception e) {
-                            log.error("🧪 [TEST] Telegram notify failed: {}", e.getMessage());
-                        }
-                    }
+        order.setStatus(com.casso.milktea.model.OrderStatus.PAID);
+        orderRepository.save(order);
 
-                    return ResponseEntity.ok(Map.of(
-                            "success", true,
-                            "orderCode", orderCode,
-                            "status", "PAID",
-                            "chatId", chatId != null ? chatId : "null"));
-                })
-                .orElse(ResponseEntity.ok(Map.of(
-                        "error", "Order not found",
-                        "orderCode", orderCode)));
+        Long chatId = order.getCustomer() != null
+                ? order.getCustomer().getTelegramChatId() : null;
+
+        if (chatId != null) {
+            try {
+                teaShopBot.notifyPaymentSuccess(chatId, orderCode);
+            } catch (Exception e) {
+                log.error("[TEST] Telegram notify failed: {}", e.getMessage());
+            }
+        }
+
+        return ResponseEntity.ok(Map.of(
+                "success", true,
+                "orderCode", orderCode,
+                "status", "PAID",
+                "chatId", chatId != null ? chatId : "null"));
     }
 
     /**
