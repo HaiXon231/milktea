@@ -104,7 +104,7 @@ public class OrderService {
             order.setPaymentUrl(response.getCheckoutUrl());
             orderRepository.save(order);
 
-            // Clear the cart after successful order creation
+            // Clear the cart ONLY after successfully creating payment link
             cartService.clearCart(customer);
 
             // Build order summary
@@ -119,19 +119,19 @@ public class OrderService {
                         item.getSize(), item.getSubtotal()));
             }
             sb.append(String.format("\n💰 Tổng cộng: %,dđ\n", totalAmount));
-            sb.append("\n💳 Thanh toán QR tại link bên dưới nha con!");
+            sb.append("\n💳 LINK THANH TOÁN QR:\n").append(response.getCheckoutUrl());
+            sb.append("\n\nCon nhấn vào link trên để quét QR thanh toán nha!");
 
             return new OrderResult(true, sb.toString(), response.getCheckoutUrl(), orderCode);
 
         } catch (Exception e) {
             log.error("Failed to create payOS payment link for order {}", orderCode, e);
-            // Still save order so it can be retried
+            // DO NOT clear cart on failure — user can retry with the same cart
             order.setStatus(OrderStatus.PENDING);
             orderRepository.save(order);
-            cartService.clearCart(customer);
             return new OrderResult(false,
-                    "Tạo đơn #" + orderCode + " thành công nhưng chưa tạo được link thanh toán. "
-                            + "Con nhắn lại 'thanh toán' để mẹ gửi lại link nha!",
+                    "Tạo link thanh toán thất bại: " + e.getMessage() + ". "
+                            + "Con nhắn lại 'thanh toán' để thử lại nha! Đơn hàng vẫn còn trong giỏ 😊",
                     null, orderCode);
         }
     }

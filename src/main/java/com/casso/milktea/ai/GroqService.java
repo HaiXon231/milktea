@@ -4,30 +4,24 @@ import com.casso.milktea.model.ConversationMessage;
 import com.casso.milktea.model.Customer;
 import com.fasterxml.jackson.databind.JsonNode;
 import com.fasterxml.jackson.databind.ObjectMapper;
+import com.fasterxml.jackson.databind.node.ArrayNode;
+import com.fasterxml.jackson.databind.node.ObjectNode;
 import lombok.RequiredArgsConstructor;
 import lombok.extern.slf4j.Slf4j;
 import org.springframework.beans.factory.annotation.Value;
 import org.springframework.stereotype.Service;
 import org.springframework.web.client.RestTemplate;
 
-import java.util.ArrayList;
-import java.util.HashMap;
-import java.util.List;
-import java.util.Map;
+import java.util.*;
 
 /**
- * Direct Groq API integration — bypasses Spring AI completely.
+ * Direct Gemini API integration — bypasses Spring AI completely.
  *
- * Tool design (new):
- * - find_item_by_name(name)   → fuzzy search by Vietnamese name → FOUND:TS01|Tên|priceM|priceL
- * - get_menu(category?)       → return full menu
- * - view_cart()               → show cart
- * - add_to_cart(itemId,size,qty) → add AFTER confirmation
- * - remove_from_cart(itemId,size)
- * - update_cart_item(itemId,size,qty)
- * - get_best_sellers(category?) → top sellers
- * - checkout(name,phone,addr,note?) → create order + payOS link
- * - recommend(preference?)     → suggest by preference
+ * Request flow:
+ *  1. IntentDetector (fast path) — handles simple, high-confidence intents
+ *  2. Gemini (reasoning path) — complex conversations, ambiguous requests
+ *
+ * ConfirmationState tracks pending confirmations so we don't ask twice.
  */
 @Service
 @RequiredArgsConstructor
@@ -37,6 +31,8 @@ public class GroqService {
     private final RestTemplate restTemplate;
     private final ObjectMapper objectMapper;
     private final AiToolFunctions toolFunctions;
+    private final IntentDetector intentDetector;
+    private final ConfirmationState confirmationState;
 
     @Value("${spring.ai.openai.api-key}")
     private String apiKey;
@@ -47,72 +43,718 @@ public class GroqService {
     @Value("${spring.ai.openai.chat.options.model}")
     private String model;
 
-    // ── Public entry point ──────────────────────────────────────
+    // ══════════════════════════════════════════════════════════════
+    //  PUBLIC ENTRY POINT
+    // ══════════════════════════════════════════════════════════════
 
     public ChatResponse chat(Customer customer, String userMessage,
             List<ConversationMessage> history) {
-        // Fast path: greetings never need Groq
-        if (isGreeting(userMessage)) {
-            return new ChatResponse(buildGreeting());
+
+        String msg = userMessage != null ? userMessage.trim() : "";
+
+        // ── Fast path: intent detection ──────────────────────────
+        IntentDetector.DetectedIntent intent = intentDetector.detect(msg, customer);
+
+        // GREETING — fast path, no Gemini needed
+        if (intent != null && intent.type == IntentDetector.DetectedIntent.Type.GREETING) {
+            return new ChatResponse(buildGreeting(), null, null);
         }
 
-        try {
-            List<Map<String, String>> messages = buildMessages(customer, history, userMessage);
+        // HELP — fast path
+        if (intent != null && intent.type == IntentDetector.DetectedIntent.Type.HELP) {
+            return new ChatResponse(buildHelpText(), null, null);
+        }
 
-            // Turn 1
-            JsonNode groqResponse = callGroqWithRetry(messages, true);
-            String assistantText = extractText(groqResponse);
-            JsonNode toolCalls = groqResponse.path("choices").get(0)
-                    .path("message").path("tool_calls");
+        // AFFIRM / NEGATE — handle pending confirmations FIRST
+        if (intent != null
+                && (intent.type == IntentDetector.DetectedIntent.Type.AFFIRM
+                    || intent.type == IntentDetector.DetectedIntent.Type.NEGATE)) {
+            return handleConfirmation(customer, intent.type == IntentDetector.DetectedIntent.Type.AFFIRM);
+        }
 
-            if (toolCalls.isArray() && !toolCalls.isEmpty()) {
-                // Groq wants to call tool(s)
-                Map<String, String> assistantMsg = new HashMap<>();
-                assistantMsg.put("role", "assistant");
-                assistantMsg.put("content", assistantText != null ? assistantText : "");
-                messages.add(assistantMsg);
+        // SIZE-ONLY response — user replied with size to a pending confirmation
+        if (intent != null && intent.type == IntentDetector.DetectedIntent.Type.SIZE_ONLY) {
+            return handleSizeOnly(customer, intent.rawMessage);
+        }
 
-                for (JsonNode tc : toolCalls) {
-                    String toolName = tc.path("function").path("name").asText();
-                    String rawArgs = tc.path("function").path("arguments").asText();
-                    String result = executeTool(toolName, rawArgs, customer);
+        // ── Tool-call intents (fast path — no Gemini needed) ─────
+        if (intent != null && intent.isToolCall()) {
+            return handleDirectToolCall(customer, intent);
+        }
 
-                    Map<String, String> toolMsg = new HashMap<>();
-                    toolMsg.put("role", "tool");
-                    toolMsg.put("tool_call_id", tc.path("id").asText());
-                    toolMsg.put("content", result);
-                    messages.add(toolMsg);
+        // ── Complex intent or unknown — Gemini reasoning ─────────
+        return chatWithGemini(customer, msg, history);
+    }
 
-                    log.info("Tool [{}] → {}", toolName,
-                            result.length() > 100 ? result.substring(0, 100) + "..." : result);
+    // ══════════════════════════════════════════════════════════════
+    //  FAST PATH — DIRECT TOOL CALLS
+    // ══════════════════════════════════════════════════════════════
+
+    private ChatResponse handleDirectToolCall(Customer customer,
+            IntentDetector.DetectedIntent intent) {
+
+        return switch (intent.type) {
+            case MENU -> {
+                String result = toolFunctions.getMenu(intent.category);
+                yield new ChatResponse(result, null, null);
+            }
+            case VIEW_CART -> {
+                String result = toolFunctions.viewCart(customer);
+                yield new ChatResponse(result, null, null);
+            }
+            case CLEAR_CART -> {
+                String result = toolFunctions.clearCart(customer);
+                yield new ChatResponse(result, null, null);
+            }
+            case BEST_SELLERS -> {
+                String result = toolFunctions.getBestSellers(intent.category);
+                yield new ChatResponse(result, null, null);
+            }
+            case CHECKOUT -> {
+                // No delivery info yet — need to ask
+                String result = toolFunctions.viewCart(customer);
+                String followUp = "\n\nCon cho mẹ biết thêm thông tin giao hàng nha:\n"
+                        + "👤 Tên người nhận: ...\n📞 SĐT: ...\n📍 Địa chỉ: ...";
+                yield new ChatResponse(result + followUp, null, null);
+            }
+            default -> {
+                // Shouldn't happen — treat as Gemini path
+                yield null;
+            }
+        };
+    }
+
+    // ══════════════════════════════════════════════════════════════
+    //  CONFIRMATION HANDLING
+    // ══════════════════════════════════════════════════════════════
+
+    /**
+     * User said YES or NO to a pending confirmation.
+     */
+    private ChatResponse handleConfirmation(Customer customer, boolean affirmed) {
+        ConfirmationState.PendingAction pending = confirmationState.peek(customer.getId());
+
+        if (pending == null) {
+            // No pending action — treat as normal message
+            return chatWithGemini(customer, affirmed ? "đúng rồi" : "không", List.of());
+        }
+
+        if (!affirmed) {
+            // User said NO — clear pending and acknowledge
+            confirmationState.clear(customer.getId());
+            return new ChatResponse("OK con, không sao cả! Con muốn uống gì khác không? 😊", null, null);
+        }
+
+        // User affirmed — execute the pending action
+        switch (pending.type()) {
+            case ADD_TO_CART -> {
+                String result = toolFunctions.addToCart(customer,
+                        pending.itemId(), pending.size(), pending.quantity());
+                confirmationState.clear(customer.getId());
+                // Follow-up
+                String followUp = buildAddToCartFollowUp(pending);
+                return new ChatResponse(result + "\n\n" + followUp, null, null);
+            }
+            case CHECKOUT -> {
+                // Delivery info was already confirmed — call checkout
+                String[] parts = pending.context().split("\\|", -1);
+                String name = parts.length > 0 ? parts[0] : null;
+                String phone = parts.length > 1 ? parts[1] : null;
+                String address = parts.length > 2 ? parts[2] : null;
+                String note = pending.itemId(); // note stored in itemId field
+
+                var orderResult = toolFunctions.checkout(customer, name, phone, address, note);
+                confirmationState.clear(customer.getId());
+
+                if (orderResult.success()) {
+                    return new ChatResponse(orderResult.message(),
+                            orderResult.paymentUrl(), orderResult.orderCode());
+                } else {
+                    // Delivery info missing — ask again
+                    return new ChatResponse(orderResult.message(), null, null);
                 }
-
-                // Turn 2: Groq generates natural response with tool results
-                groqResponse = callGroqWithRetry(messages, false);
-                assistantText = extractText(groqResponse);
             }
-
-            if (assistantText == null || assistantText.isBlank()) {
-                assistantText = "Mẹ nghe con rồi nhưng chưa hiểu lắm 😅 Con nhắn rõ hơn giúp mẹ nha!";
+            default -> {
+                confirmationState.clear(customer.getId());
+                return new ChatResponse("OK con! Con muốn làm gì tiếp nha?", null, null);
             }
-
-            return new ChatResponse(assistantText);
-
-        } catch (Exception e) {
-            log.error("GroqService error: {}", e.getMessage(), e);
-            return new ChatResponse(errorMessage(e));
         }
     }
 
-    // ── Greeting fast path (no Groq call) ─────────────────────────
+    /**
+     * User replied with just a size (e.g., "L", "lớn", "size M").
+     */
+    private ChatResponse handleSizeOnly(Customer customer, String msg) {
+        ConfirmationState.PendingAction pending = confirmationState.peek(customer.getId());
 
-    private boolean isGreeting(String userMessage) {
-        if (userMessage == null || userMessage.length() > 40) return false;
-        String msg = userMessage.trim().toLowerCase();
-        return msg.contains("xin chao") || msg.contains("chào") || msg.contains("hello")
-                || msg.matches(".*\\bhi\\b.*") || msg.matches(".*\\bhey\\b.*")
-                || msg.contains("good morning") || msg.contains("good afternoon")
-                || msg.contains("buổi sáng") || msg.contains("buổi trưa") || msg.contains("buổi chiều");
+        if (pending != null && pending.type() == ConfirmationState.ActionType.ADD_TO_CART) {
+            // User wants to change the size in the pending add-to-cart
+            String newSize = extractSize(msg);
+            if (newSize != null && !newSize.equals(pending.size())) {
+                // Update pending action with new size
+                var updated = new ConfirmationState.PendingAction(
+                        pending.type(), pending.itemId(), pending.itemName(),
+                        newSize, pending.quantity(), pending.timestamp(), pending.context());
+                confirmationState.save(customer.getId(), updated);
+
+                return new ChatResponse(String.format(
+                        "OK, đổi sang size %s nhe con! %dx %s (size %s) như vậy đúng không?",
+                        newSize, pending.quantity(), pending.itemName(), newSize), null, null);
+            } else if (newSize != null) {
+                // Same size confirmed
+                return handleConfirmation(customer, true);
+            }
+        }
+
+        return chatWithGemini(customer, msg, List.of());
+    }
+
+    // ══════════════════════════════════════════════════════════════
+    //  GEMINI REASONING PATH
+    // ══════════════════════════════════════════════════════════════
+
+    private ChatResponse chatWithGemini(Customer customer, String userMessage,
+            List<ConversationMessage> history) {
+
+        try {
+            List<Map<String, Object>> contents = buildContents(customer, history, userMessage);
+
+            // Turn 1: send to Gemini with tools
+            JsonNode response = callGeminiWithRetry(contents, true);
+            String text = extractText(response);
+            List<Map<String, Object>> toolCalls = extractFunctionCalls(response);
+
+            if (!toolCalls.isEmpty()) {
+                // Append model's text as a content part
+                if (text != null && !text.isBlank()) {
+                    contents.add(part("model", text));
+                }
+
+                // Execute each tool and append results
+                for (Map<String, Object> tc : toolCalls) {
+                    String toolName = (String) tc.get("name");
+                    JsonNode rawArgs = (JsonNode) tc.get("args");
+                    String result = executeTool(toolName, rawArgs, customer, contents);
+
+                    contents.add(functionResponsePart(toolName, result));
+                    log.info("Tool [{}] → {}", toolName,
+                            result.length() > 120 ? result.substring(0, 120) + "..." : result);
+                }
+
+                // Turn 2: Gemini generates natural response with tool results
+                response = callGeminiWithRetry(contents, false);
+                text = extractText(response);
+            }
+
+            if (text == null || text.isBlank()) {
+                text = "Mẹ nghe con rồi nhưng chưa hiểu lắm 😅 Con nhắn rõ hơn giúp mẹ nha!";
+            }
+
+            return new ChatResponse(text, null, null);
+
+        } catch (Exception e) {
+            log.error("GroqService error: {}", e.getMessage(), e);
+            return new ChatResponse(errorMessage(e), null, null);
+        }
+    }
+
+    // ══════════════════════════════════════════════════════════════
+    //  TOOL EXECUTION
+    // ══════════════════════════════════════════════════════════════
+
+    /**
+     * Execute a tool and return the result string.
+     * For add_to_cart/checkout: also saves pending confirmation state.
+     */
+    private String executeTool(String toolName, JsonNode rawArgs,
+            Customer customer, List<Map<String, Object>> contents) {
+
+        JsonNode args = rawArgs != null ? rawArgs : objectMapper.createObjectNode();
+
+        return switch (toolName) {
+            case "find_item_by_name" -> {
+                String result = toolFunctions.findItemByName(extractString(args, "name"));
+                // NOTE: We do NOT auto-add here. The result is returned to Gemini
+                // so it can ask confirmation. Gemini will call add_to_cart AFTER confirming.
+                yield result;
+            }
+
+            case "get_menu" -> toolFunctions.getMenu(extractString(args, "category"));
+
+            case "view_cart" -> toolFunctions.viewCart(customer);
+
+            case "add_to_cart" -> {
+                String itemId = extractString(args, "item_id");
+                String size = normalizeSize(extractString(args, "size"));
+                int qty = extractInt(args, "quantity", 1);
+                yield toolFunctions.addToCart(customer, itemId, size, qty);
+            }
+
+            case "remove_from_cart" -> toolFunctions.removeFromCart(customer,
+                    extractString(args, "item_id"), normalizeSize(extractString(args, "size")));
+
+            case "update_cart_item" -> toolFunctions.updateCartItem(customer,
+                    extractString(args, "item_id"), normalizeSize(extractString(args, "size")),
+                    extractInt(args, "quantity", 1));
+
+            case "get_best_sellers" -> toolFunctions.getBestSellers(
+                    extractString(args, "category"));
+
+            case "checkout" -> {
+                String name = extractString(args, "name");
+                String phone = extractString(args, "phone");
+                String address = extractString(args, "address");
+                String note = extractString(args, "note");
+
+                // Validate — if missing info, tell Gemini to ask
+                String missing = validateDeliveryInfo(name, phone, address);
+                if (missing != null) {
+                    // DO NOT call real checkout — return instruction to ask user
+                    confirmationState.clear(customer.getId()); // clear stale state
+                    yield "THIẾU_THÔNG_TIN: " + missing
+                            + ". Hãy hỏi khách cung cấp thông tin còn thiếu trước khi gọi checkout.";
+                }
+
+                // All info present — execute checkout
+                var orderResult = toolFunctions.checkout(customer, name, phone, address, note);
+                confirmationState.clear(customer.getId());
+
+                // Return structured result for Gemini to parse
+                if (orderResult.success()) {
+                    yield "CHECKOUT_THÀNH_CÔNG|"
+                            + orderResult.orderCode() + "|"
+                            + orderResult.paymentUrl() + "|"
+                            + orderResult.message();
+                } else {
+                    yield "CHECKOUT_THẤT_BẠI: " + orderResult.message();
+                }
+            }
+
+            case "recommend" -> toolFunctions.getRecommendation(
+                    extractString(args, "preference"));
+
+            case "clear_cart" -> toolFunctions.clearCart(customer);
+
+            default -> "Hàm '" + toolName + "' không tồn tại — con nhắn lại giúp mẹ nha!";
+        };
+    }
+
+    /**
+     * Check if delivery info is complete.
+     * Returns null if all present, error message if missing.
+     */
+    private String validateDeliveryInfo(String name, String phone, String address) {
+        StringBuilder sb = new StringBuilder();
+        if (name == null || name.isBlank()) sb.append("tên người nhận, ");
+        if (phone == null || phone.isBlank()) sb.append("số điện thoại, ");
+        if (address == null || address.isBlank()) sb.append("địa chỉ giao hàng, ");
+        if (sb.isEmpty()) return null;
+        return sb.substring(0, sb.length() - 2);
+    }
+
+    // ══════════════════════════════════════════════════════════════
+    //  GEMINI HTTP CALLS
+    // ══════════════════════════════════════════════════════════════
+
+    private JsonNode callGemini(List<Map<String, Object>> contents, boolean withTools)
+            throws Exception {
+
+        String url = baseUrl + "/models/" + model + ":generateContent?key=" + apiKey;
+
+        ObjectNode body = objectMapper.createObjectNode();
+        ObjectNode genConfig = body.putObject("generationConfig");
+        genConfig.put("maxOutputTokens", 1024);
+        genConfig.put("temperature", 0.7);
+
+        ArrayNode contentsArray = body.putArray("contents");
+        for (Map<String, Object> c : contents) {
+            contentsArray.add(objectMapper.valueToTree(c));
+        }
+
+        if (withTools) {
+            ArrayNode toolsArray = body.putArray("tools");
+            ObjectNode tool = toolsArray.addObject();
+            ArrayNode decls = tool.putArray("functionDeclarations");
+            for (Map<String, Object> f : buildFunctionDeclarations()) {
+                decls.add(objectMapper.valueToTree(f));
+            }
+        }
+
+        org.springframework.http.HttpHeaders headers = new org.springframework.http.HttpHeaders();
+        headers.setContentType(org.springframework.http.MediaType.APPLICATION_JSON);
+
+        String json = objectMapper.writeValueAsString(body);
+        String responseStr = restTemplate.postForObject(url,
+                new org.springframework.http.HttpEntity<>(json, headers),
+                String.class);
+
+        return objectMapper.readTree(responseStr);
+    }
+
+    private JsonNode callGeminiWithRetry(List<Map<String, Object>> contents, boolean withTools)
+            throws Exception {
+        int attempts = 0;
+        Exception last = null;
+
+        while (attempts < 3) {
+            try {
+                return callGemini(contents, withTools);
+            } catch (Exception e) {
+                last = e;
+                String msg = e.getMessage() != null ? e.getMessage().toLowerCase() : "";
+                if (msg.contains("429") || msg.contains("rate limit")
+                        || msg.contains("quota") || msg.contains("resource exhausted")
+                        || msg.contains("connection") || msg.contains("refused")
+                        || msg.contains("timeout") || msg.contains("timed out")) {
+                    attempts++;
+                    if (attempts < 3) {
+                        int waitMs = attempts * 2000;
+                        log.warn("Gemini retry {}/3 ({}): {}", attempts, e.getMessage(), waitMs);
+                        try { Thread.sleep(waitMs); } catch (InterruptedException ie) { break; }
+                        continue;
+                    }
+                }
+                throw e;
+            }
+        }
+        throw last != null ? last
+                : new RuntimeException("Gemini call failed after 3 attempts");
+    }
+
+    // ══════════════════════════════════════════════════════════════
+    //  GEMINI CONTENTS BUILDERS
+    // ══════════════════════════════════════════════════════════════
+
+    /**
+     * Build Gemini contents[] from system prompt + history + new user message.
+     */
+    private List<Map<String, Object>> buildContents(Customer customer,
+            List<ConversationMessage> history, String userMessage) {
+
+        List<Map<String, Object>> contents = new ArrayList<>();
+
+        // System prompt as first user turn
+        contents.add(part("user", systemPrompt(customer)));
+
+        // Conversation history
+        for (ConversationMessage msg : history) {
+            String role = "user".equals(msg.getRole()) ? "user" : "model";
+            contents.add(part(role, msg.getContent()));
+        }
+
+        // New user message
+        contents.add(part("user", userMessage));
+        return contents;
+    }
+
+    /** Build a Gemini Part (content item with role + parts). */
+    private Map<String, Object> part(String role, String text) {
+        Map<String, Object> p = new LinkedHashMap<>();
+        p.put("role", role);
+        Map<String, Object> inner = new LinkedHashMap<>();
+        inner.put("text", text);
+        p.put("parts", List.of(inner));
+        return p;
+    }
+
+    /** Build a function-response part for tool results. */
+    private Map<String, Object> functionResponsePart(String name, String result) {
+        Map<String, Object> p = new LinkedHashMap<>();
+        p.put("role", "user");
+        Map<String, Object> inner = new LinkedHashMap<>();
+        Map<String, Object> fr = new LinkedHashMap<>();
+        fr.put("name", name);
+        fr.put("response", Map.of("result", result));
+        inner.put("functionResponse", fr);
+        p.put("parts", List.of(inner));
+        return p;
+    }
+
+    // ══════════════════════════════════════════════════════════════
+    //  RESPONSE EXTRACTION
+    // ══════════════════════════════════════════════════════════════
+
+    private String extractText(JsonNode response) {
+        try {
+            JsonNode parts = response.path("candidates").get(0)
+                    .path("content").path("parts");
+            StringBuilder sb = new StringBuilder();
+            for (JsonNode p : parts) {
+                String t = p.path("text").asText(null);
+                if (t != null && !t.isBlank()) {
+                    if (sb.length() > 0) sb.append("\n");
+                    sb.append(t);
+                }
+            }
+            return sb.length() > 0 ? sb.toString() : null;
+        } catch (Exception e) {
+            return null;
+        }
+    }
+
+    private List<Map<String, Object>> extractFunctionCalls(JsonNode response) {
+        List<Map<String, Object>> calls = new ArrayList<>();
+        try {
+            JsonNode parts = response.path("candidates").get(0)
+                    .path("content").path("parts");
+            for (JsonNode p : parts) {
+                JsonNode fc = p.path("functionCall");
+                if (!fc.isMissingNode()) {
+                    Map<String, Object> call = new LinkedHashMap<>();
+                    call.put("name", fc.path("name").asText());
+                    call.put("args", fc.path("args"));
+                    calls.add(call);
+                }
+            }
+        } catch (Exception e) {
+            log.warn("extractFunctionCalls failed: {}", e.getMessage());
+        }
+        return calls;
+    }
+
+    // ══════════════════════════════════════════════════════════════
+    //  SYSTEM PROMPT — VIETNAMESE MOTHER AS TEA SHOP OWNER
+    // ══════════════════════════════════════════════════════════════
+
+    /**
+     * Build the system prompt.
+     * This is the MOST IMPORTANT part — it defines how the AI behaves.
+     *
+     * Key principles:
+     * 1. NEVER ask confirmation if user already provided all info
+     * 2. Always handle the correct intent (cart, menu, etc.)
+     * 3. Speak naturally as a Vietnamese mother
+     * 4. Only call function when it makes sense
+     */
+    private String systemPrompt(Customer customer) {
+        StringBuilder sb = new StringBuilder();
+        sb.append("""
+            Bạn là Mẹ — bà chủ quán trà sữa Casso. Bạn nói chuyện như một người mẹ Việt Nam thân thiện,
+            hay nói chuyện, gọi khách là "con". KHÔNG nói như robot hay chatbot.
+
+            TÍNH CÁCH:
+            - Nói chuyện TỰ NHIÊN, THÂN THIỆN, có cảm xúc
+            - Hay dùng emoji nhẹ như 🧋😊❤️
+            - Gợi ý đồ uống, hỏi han vị khách
+            - Giọng truyền cảm hứng, như người bạn tốt
+
+            KHI PHẢN HỒI KHÁCH HÀNG, HÃY LÀM THEO CÁC QUY TẮC SAU:
+
+            ══════════════════════════════════════════════
+            QUY TẮC #1: NHẬN DIỆN Ý ĐỊNH (INTENT)
+            ══════════════════════════════════════════════
+            Trước khi trả lời, xác định ý định của khách:
+
+            » "menu" / "xem menu" / "thực đơn"
+               → Gọi get_menu() → TRẢ ĐẦY ĐỦ MENU
+
+            » "giỏ hàng" / "xem đơn" / "bill" / "check cart"
+               → Gọi view_cart() → HIỂN THỊ GIỎ HÀNG
+
+            » "bán chạy" / "best seller" / "hot"
+               → Gọi get_best_sellers()
+
+            » "thanh toán" / "checkout" / "QR"
+               → Gọi view_cart() TRƯỚC để xem có gì trong giỏ không
+               → Nếu giỏ TRỐNG → nói khách thêm món trước
+               → Nếu giỏ CÓ MÓN → hỏi thông tin giao hàng (tên, SDT, địa chỉ)
+
+            » "xóa giỏ" / "bỏ hết"
+               → Gọi clear_cart()
+
+            » Khách nói tên món ("trà sữa socola", "matcha", "sữa tươi")
+               → Gọi find_item_by_name(tên_món)
+               → Nếu kết quả bắt đầu bằng "FOUND:" →
+                 - NẾU khách đã nói đủ thông tin (size + số lượng):
+                   VD: "trà sữa socola size M 2 ly"
+                   → Gọi add_to_cart() NGAY, KHÔNG hỏi lại
+                 - NẾU khách CHỈ nói tên món (không nói size/số lượng):
+                   → HỎI XÁC NHẬN: "Trà sữa Socola như vậy nhe con — con muốn size M hay L? Mấy ly?"
+
+            ══════════════════════════════════════════════
+            QUY TẮC #2: KHÔNG HỎI LẠI THÔNG TIN ĐÃ CÓ
+            ══════════════════════════════════════════════
+            Nếu khách đã cung cấp đầy đủ thông tin cho một action,
+            THỰC HIỆN NGAY, KHÔNG hỏi lại.
+
+            Ví dụ:
+            ✗ SAI: Khách: "trà sữa socola size M" → AI: "Con muốn size M hay L?" ← HỎI LẠI
+            ✓ ĐÚNG: Khách: "trà sữa socola size M" → AI: (tìm thấy FOUND:) →
+                    Gọi add_to_cart(TS01, M, 1) → "Đã thêm 1 ly Trà sữa Socola size M vào giỏ nha con!"
+
+            ✗ SAI: Khách: "thanh toán, tên Minh, SDT 0912345678, địa chỉ 123 Nguyễn Trãi"
+                   → AI: "Con cho mẹ biết tên..." ← HỎI LẠI
+            ✓ ĐÚNG: → Gọi checkout(name=Minh, phone=0912345678, address=123 Nguyễn Trãi)
+                     → "Đơn hàng #12345 của con nè! Tổng cộng 45,000đ. Quét QR để thanh toán nha!"
+
+            ══════════════════════════════════════════════
+            QUY TẮC #3: TRẢ LỜI ĐÚNG YÊU CẦU
+            ══════════════════════════════════════════════
+            Khi khách hỏi một thứ cụ thể (giỏ hàng, menu, best seller),
+            TRẢ LỜI ĐÚNG Ý ĐỊNH đó, KHÔNG chuyển hướng sang "con muốn uống gì".
+
+            ✗ SAI: Khách: "xem giỏ hàng đi" → AI: "Con muốn uống gì hôm nay?" ← SAI
+            ✓ ĐÚNG: Khách: "xem giỏ hàng đi" → Gọi view_cart() → HIỂN THỊ GIỎ HÀNG
+
+            ══════════════════════════════════════════════
+            QUY T�ẮC #4: KHI KẾT QUẢ TOOL TRẢ VỀ
+            ══════════════════════════════════════════════
+
+            » get_menu() trả về menu đầy đủ
+               → In ra ĐẦY ĐỦ menu theo từng danh mục
+
+            » find_item_by_name() trả "FOUND:itemId|tên|giáM|giáL"
+               → ĐÃ đủ size + số lượng → Gọi add_to_cart NGAY
+               → CHƯA đủ → Hỏi xác nhận: size gì? mấy ly?
+
+            » view_cart() trả giỏ hàng
+               → In ra giỏ hàng, KHÔNG hỏi thêm gì trừ khi khách yêu cầu
+
+            » get_best_sellers() trả danh sách
+               → In ra danh sách, gợi ý khách chọn
+
+            » checkout() trả "CHECKOUT_THÀNH_CÔNG|orderCode|paymentUrl|message"
+               → In thông tin đơn hàng + LINK THANH TOÁN (RẤT QUAN TRỌNG)
+               → Phải có link QR để khách quét
+
+            » checkout() trả "THIẾU_THÔNG_TIN: ..."
+               → HỎI KHÁCH cung cấp thông tin còn thiếu thôi
+
+            ══════════════════════════════════════════════
+            QUY TẮC #5: GIỌNG VÀ PHONG CÁCH
+            ══════════════════════════════════════════════
+            - Nói CHUYỆN, không phải báo cáo
+            - Dùng emoji nhẹ nhàng
+            - Kết thúc bằng câu mời: "Con muốn uống gì nữa không?" sau khi thêm món
+            - Khen khách khi chọn món ngon: "Ơ, con biết chọn nè!" 😊
+            """);
+
+        return sb.toString();
+    }
+
+    // ══════════════════════════════════════════════════════════════
+    //  GEMINI FUNCTION DECLARATIONS
+    // ══════════════════════════════════════════════════════════════
+
+    private List<Map<String, Object>> buildFunctionDeclarations() {
+        return List.of(
+                fd("find_item_by_name",
+                        "Tim mon trong menu bang ten tieng Viet. "
+                                + "VD: 'tra sua socola', 'matcha', 'sua tuoi'. "
+                                + "Tra ve 'FOUND:itemId|ten|priceM|priceL' hoac loi khong tim thay.",
+                        List.of(param("name", "string",
+                                "Ten mon tieng Viet (VD: 'tra sua socola', 'matcha')")))),
+
+                fd("get_menu",
+                        "Xem TOAN BO menu: ten mon, gia M/L theo tung danh muc. "
+                                + "Luon tra day du menu khi khach yeu cau.",
+                        List.of(param("category", "string",
+                                "Danh muc (tuy chon): Tra Sua, Tra Trai Cay, Ca Phe, Da Xay, Topping")))),
+
+                fd("view_cart",
+                        "Xem gio hang hien tai cua khach. Tra ve danh sach mon + tong tien.",
+                        Collections.emptyList()),
+
+                fd("clear_cart",
+                        "Xoa toan bo gio hang.",
+                        Collections.emptyList()),
+
+                fd("add_to_cart",
+                        "Them mon vao gio hang. CHI goi SAU KHI da xac nhan voi khach "
+                                + "(hoac khach da noi du: ten mon + size + so luong).",
+                        List.of(
+                                param("item_id", "string",
+                                        "Ma mon (VD: TS01, TSTC01...) — lay tu find_item_by_name"),
+                                param("size", "string", "Size: M (Medium) hoac L (Large)"),
+                                param("quantity", "integer", "So luong ly, mac dinh 1"))),
+
+                fd("remove_from_cart",
+                        "Xoa mot mon khoi gio hang.",
+                        List.of(
+                                param("item_id", "string", "Ma mon"),
+                                param("size", "string", "Size M hoac L"))),
+
+                fd("update_cart_item",
+                        "Sua so luong mot mon trong gio. Neu quantity = 0 thi xoa mon.",
+                        List.of(
+                                param("item_id", "string", "Ma mon"),
+                                param("size", "string", "Size M hoac L"),
+                                param("quantity", "integer", "So luong moi"))),
+
+                fd("get_best_sellers",
+                        "Xem cac mon ban chay nhat.",
+                        List.of(param("category", "string", "Danh muc (tuy chon)"))),
+
+                fd("checkout",
+                        "CHOT DON va tao link thanh toan QR payOS. "
+                                + "BAT BUOC phai co: ten nguoi nhan, SDT, dia chi giao hang. "
+                                + "Neu thieu thong tin -> KHONG goi, hoi khach truoc!",
+                        List.of(
+                                param("name",    "string", "Ten nguoi nhan"),
+                                param("phone",   "string", "So dien thoai nguoi nhan"),
+                                param("address", "string", "Dia chi giao hang day du"),
+                                param("note",    "string", "Ghi chu don hang (tuy chon)"))),
+
+                fd("recommend",
+                        "Go y do uong theo so thich. VD: 'socola', 'tra xanh', 'matcha'.",
+                        List.of(param("preference", "string", "So thich hoac ban than (tuy chon)")))
+        );
+    }
+
+    private Map<String, Object> fd(String name, String desc, List<Map<String, Object>> params) {
+        Map<String, Object> f = new LinkedHashMap<>();
+        f.put("name", name);
+        f.put("description", desc);
+        Map<String, Object> paramObj = new LinkedHashMap<>();
+        paramObj.put("type", "object");
+        Map<String, Object> properties = new LinkedHashMap<>();
+        List<String> required = new ArrayList<>();
+        for (Map<String, Object> p : params) {
+            String pname = (String) p.get("name");
+            properties.put(pname, Map.of(
+                    "type", p.get("type"),
+                    "description", p.get("description")));
+            required.add(pname);
+        }
+        paramObj.put("properties", properties);
+        paramObj.put("required", required);
+        f.put("parameters", paramObj);
+        return f;
+    }
+
+    private Map<String, Object> param(String name, String type, String description) {
+        return Map.of("name", name, "type", type, "description", description);
+    }
+
+    // ══════════════════════════════════════════════════════════════
+    //  HELPERS
+    // ══════════════════════════════════════════════════════════════
+
+    private String extractString(JsonNode args, String field) {
+        JsonNode n = args.path(field);
+        return n.isMissingNode() || n.isNull() ? null : n.asText();
+    }
+
+    private int extractInt(JsonNode args, String field, int fallback) {
+        JsonNode n = args.path(field);
+        return n.isMissingNode() || n.isNull() ? fallback : n.asInt();
+    }
+
+    private String normalizeSize(String size) {
+        if (size == null || size.isBlank()) return "M";
+        String s = size.trim().toUpperCase();
+        return s.startsWith("L") ? "L" : "M";
+    }
+
+    private String extractSize(String msg) {
+        if (msg == null) return null;
+        String s = msg.toUpperCase().trim();
+        if (s.equals("L") || s.equals("LỚN") || s.equals("LARGE")) return "L";
+        if (s.equals("M") || s.equals("NHỎ") || s.equals("MEDIUM")) return "M";
+        // "size L", "size M"
+        if (s.contains("L") && !s.contains("M")) return "L";
+        if (s.contains("M")) return "M";
+        return null;
     }
 
     private String buildGreeting() {
@@ -121,316 +763,33 @@ public class GroqService {
                 "Hey con! Vô quán rồi hả? Mẹ đang đợi nè! 😊",
                 "Chào con! Mừng con ghé quán nha! Uống gì cho mẹ biết? 😊"
         };
-        return greetings[(int) (System.currentTimeMillis() / 60000) % greetings.length];
+        return greetings[(int) (System.currentTimeMillis() / 60_000) % greetings.length];
     }
 
-    // ── HTTP calls ────────────────────────────────────────────────
-
-    private JsonNode callGroq(List<Map<String, String>> messages, boolean withTools)
-            throws Exception {
-        String url = baseUrl + "/v1/chat/completions";
-
-        Map<String, Object> body = new HashMap<>();
-        body.put("model", model);
-        body.put("temperature", 0.1);   // 0.0 → 0.1 to reduce tool_call instability
-        body.put("max_tokens", 1024);
-        body.put("messages", messages);
-
-        if (withTools) {
-            body.put("tools", buildTools());
-            body.put("tool_choice", "auto");
-        }
-
-        String json = objectMapper.writeValueAsString(body);
-
-        org.springframework.http.HttpHeaders headers = new org.springframework.http.HttpHeaders();
-        headers.setBearerAuth(apiKey);
-        headers.setContentType(org.springframework.http.MediaType.APPLICATION_JSON);
-
-        String response = restTemplate.postForObject(url,
-                new org.springframework.http.HttpEntity<>(json, headers),
-                String.class);
-
-        return objectMapper.readTree(response);
-    }
-
-    private JsonNode callGroqWithRetry(List<Map<String, String>> messages, boolean withTools)
-            throws Exception {
-        int attempts = 0;
-        Exception lastException = null;
-
-        while (attempts < 3) {
-            try {
-                return callGroq(messages, withTools);
-            } catch (Exception e) {
-                lastException = e;
-                String msg = e.getMessage() != null ? e.getMessage().toLowerCase() : "";
-                if (msg.contains("429") || msg.contains("rate limit")
-                        || msg.contains("connection") || msg.contains("refused")
-                        || msg.contains("timeout") || msg.contains("timed out")) {
-                    attempts++;
-                    if (attempts < 3) {
-                        int waitMs = attempts * 1500;
-                        log.warn("Groq retry {}/3 ({}): {}", attempts, e.getMessage(), waitMs);
-                        try { Thread.sleep(waitMs); } catch (InterruptedException ie) { break; }
-                        continue;
-                    }
-                }
-                throw e;   // non-retryable error
-            }
-        }
-        throw lastException != null ? lastException
-                : new RuntimeException("Groq call failed after 3 attempts");
-    }
-
-    // ── Tool execution ──────────────────────────────────────────
-
-    private String executeTool(String toolName, String rawArgs, Customer customer)
-            throws Exception {
-        JsonNode args = parseArgs(rawArgs);
-
-        return switch (toolName) {
-            // 1. Tìm món theo tên tiếng Việt (NEW — core fix)
-            case "find_item_by_name" -> toolFunctions.findItemByName(
-                    args.has("name") && !args.get("name").isNull()
-                            ? args.get("name").asText()
-                            : null);
-
-            // 2. Menu
-            case "get_menu" -> toolFunctions.getMenu(
-                    args.has("category") && !args.get("category").isNull()
-                            ? args.get("category").asText()
-                            : null);
-
-            // 3. Xem giỏ
-            case "view_cart" -> toolFunctions.viewCart(customer);
-
-            // 4. Thêm vào giỏ
-            case "add_to_cart" -> toolFunctions.addToCart(customer,
-                    args.get("item_id").asText(),
-                    args.has("size") && !args.get("size").isNull()
-                            ? args.get("size").asText().toUpperCase()
-                            : "M",
-                    args.has("quantity") && !args.get("quantity").isNull()
-                            ? args.get("quantity").asInt()
-                            : 1);
-
-            // 5. Xóa khỏi giỏ
-            case "remove_from_cart" -> toolFunctions.removeFromCart(customer,
-                    args.get("item_id").asText(),
-                    args.has("size") && !args.get("size").isNull()
-                            ? args.get("size").asText().toUpperCase()
-                            : "M");
-
-            // 6. Sửa số lượng
-            case "update_cart_item" -> toolFunctions.updateCartItem(customer,
-                    args.get("item_id").asText(),
-                    args.has("size") && !args.get("size").isNull()
-                            ? args.get("size").asText().toUpperCase()
-                            : "M",
-                    args.has("quantity") && !args.get("quantity").isNull()
-                            ? args.get("quantity").asInt()
-                            : 1);
-
-            // 7. Món bán chạy
-            case "get_best_sellers" -> toolFunctions.getBestSellers(
-                    args.has("category") && !args.get("category").isNull()
-                            ? args.get("category").asText()
-                            : null);
-
-            // 8. Checkout + thu thập thông tin giao hàng (NEW)
-            case "checkout" -> {
-                var res = toolFunctions.checkout(customer,
-                        args.has("name") && !args.get("name").isNull()
-                                ? args.get("name").asText()
-                                : null,
-                        args.has("phone") && !args.get("phone").isNull()
-                                ? args.get("phone").asText()
-                                : null,
-                        args.has("address") && !args.get("address").isNull()
-                                ? args.get("address").asText()
-                                : null,
-                        args.has("note") && !args.get("note").isNull()
-                                ? args.get("note").asText()
-                                : null);
-                yield res.toToolResult();
-            }
-
-            // 9. Gợi ý theo sở thích (NEW)
-            case "recommend" -> toolFunctions.getRecommendation(
-                    args.has("preference") && !args.get("preference").isNull()
-                            ? args.get("preference").asText()
-                            : null);
-
-            default -> "Hàm '" + toolName + "' không tồn tại — con nhắn lại giúp mẹ nha!";
-        };
-    }
-
-    /**
-     * Safely parse JSON args. Handles "null" literal string from Groq.
-     */
-    private JsonNode parseArgs(String rawArgs) {
-        if (rawArgs == null || rawArgs.isBlank() || "null".equals(rawArgs.trim())) {
-            return objectMapper.createObjectNode();
-        }
-        try {
-            JsonNode node = objectMapper.readTree(rawArgs);
-            return (node != null && !node.isNull()) ? node : objectMapper.createObjectNode();
-        } catch (Exception e) {
-            log.warn("Failed to parse args '{}', using empty object", rawArgs);
-            return objectMapper.createObjectNode();
-        }
-    }
-
-    // ── Message building ────────────────────────────────────────
-
-    private List<Map<String, String>> buildMessages(Customer customer,
-            List<ConversationMessage> history, String userMessage) {
-        List<Map<String, String>> messages = new ArrayList<>();
-        messages.add(Map.of("role", "system", "content", systemPrompt()));
-        for (var msg : history) {
-            messages.add(Map.of("role", msg.getRole(), "content", msg.getContent()));
-        }
-        messages.add(Map.of("role", "user", "content", userMessage));
-        return messages;
-    }
-
-    private String systemPrompt() {
+    private String buildHelpText() {
         return """
-                Ban la Me - ba chu quan tra sua Casso, noi chuyen nhieu, goi khach la "con".
+            🧋 Mẹ là AI của quán trà sữa Casso nè!
 
-                PERSONALITY: Noi chuyen tu nhien nhu nguoi Ban than, co cam xuc, goi y tu van tot, de thuong.
+            Con có thể:
+            • "xem menu" — xem toàn bộ thực đơn
+            • "bán chạy" — xem món hot nhất
+            • Nói tên món con thích — VD: "trà sữa socola"
+            • "xem giỏ hàng" — kiểm tra đơn đã đặt
+            • "thanh toán" — tạo QR chuyển khoản
 
-                WHEN REPLYING:
-                - NOI CHUYEN TU NHIEN, CO CAM XUC — khong giong doc bao.
-                - LUON IN DAY DU KET QUA KHI GOI FUNCTION (menu, gio hang, bill...).
-                - NEU goi find_item_by_name() va ket qua bat dau bang "FOUND:" → TRANH VIET LAI MENU,
-                  chi can HOI XAC NHAN: "Minh tim thay [ten mon] — [size] nhu vay nhe con?"
-                - NEU goi get_menu() → PHAI IN NGUYEN MENU, khong rut gon.
-
-                CONVERSATION FLOW:
-                1. Khach muon dat mon → goi find_item_by_name(name) truoc.
-                2. Neu tim thay → HOI XAC NHAN: "[ten mon], size M/L, [so luong] nhu vay nhe con?"
-                3. Sau khi khach xac nhan → goi add_to_cart().
-                4. Khach hoi gio hang / xem don → goi view_cart().
-                5. Khach muon thanh toan → HOI thong tin: ten, SDT, dia chi giao hang.
-                   Sau khi co day du thong tin → goi checkout().
-                6. Khach hoi goi y → goi recommend(preference).
-
-                MENU CATEGORIES: Tra Sua, Tra Trai Cay, Ca Phe, Da Xay, Topping
-                AVAILABLE SIZES: M (Medium) va L (Large)
-                MAX_TOPPING: 3 topping 1 lan
-
-                RULES:
-                - Chi ban mon trong menu.
-                - Khi xac nhan them gio → hoi: "[mon], size [M/L], [sl] ly nhu vay nhe con?"
-                - Khong tu tinh tien.
-                - Khong ro thi hoi lai.
-                - Giao hang: thu thap TEN + SDT + DIA CHI truoc khi checkout.
-                """;
+            Con muốn uống gì nào? 😊
+            """;
     }
 
-    // ── Tool schema (9 tools) ────────────────────────────────────
-
-    private List<Map<String, Object>> buildTools() {
-        return List.of(
-                // 1. Tìm món theo tên (thay vì item_id)
-                tool("find_item_by_name",
-                        "Tim mon trong menu bang ten tieng Viet (VD: 'tra sua socola', 'sua tuoi'). "
-                                + "Tra ve 'FOUND:itemId|ten|giaM|giaL' hoac loi khong tim thay.",
-                        Map.of("name", Map.of("type", "string",
-                                "description", "Ten mon tieng Viet (VD: 'tra sua socola', 'matcha')"))),
-
-                // 2. Xem menu
-                tool("get_menu",
-                        "Xem toan bo menu: ten mon, gia M/L.",
-                        Map.of("category", Map.of("type", "string",
-                                "description", "Danh muc (tuy chon): Tra Sua, Tra Trai Cay, Ca Phe, Da Xay, Topping"))),
-
-                // 3. Xem giỏ hàng
-                tool("view_cart",
-                        "Xem gio hang hien tai.",
-                        Map.of()),
-
-                // 4. Thêm vào giỏ (sau khi khách xác nhận)
-                tool("add_to_cart",
-                        "Them mon vao gio hang (DA xac nhan voi khach roi).",
-                        Map.of(
-                                "item_id", Map.of("type", "string",
-                                        "description", "Ma mon (VD: TS01, TSTC...) — lay tu find_item_by_name"),
-                                "size", Map.of("type", "string",
-                                        "description", "Size M hoac L (mac dinh M)"),
-                                "quantity", Map.of("type", "integer",
-                                        "description", "So luong, mac dinh 1"))),
-
-                // 5. Xóa khỏi giỏ
-                tool("remove_from_cart",
-                        "Xoa mon khoi gio hang.",
-                        Map.of(
-                                "item_id", Map.of("type", "string", "description", "Ma mon"),
-                                "size", Map.of("type", "string", "description", "Size M hoac L"))),
-
-                // 6. Sửa số lượng
-                tool("update_cart_item",
-                        "Sua so luong mon trong gio hang.",
-                        Map.of(
-                                "item_id", Map.of("type", "string", "description", "Ma mon"),
-                                "size", Map.of("type", "string", "description", "Size M hoac L"),
-                                "quantity", Map.of("type", "integer", "description", "So luong moi"))),
-
-                // 7. Món bán chạy
-                tool("get_best_sellers",
-                        "Xem mon ban chay nhat.",
-                        Map.of("category", Map.of("type", "string",
-                                "description", "Danh muc (tuy chon)"))),
-
-                // 8. Checkout — yêu cầu đủ thông tin giao hàng
-                tool("checkout",
-                        "Chot don hang va tao link thanh toan QR payOS. "
-                                + "CAN: ten nguoi nhan, SDT, dia chi giao hang.",
-                        Map.of(
-                                "name", Map.of("type", "string",
-                                        "description", "Ten nguoi nhan"),
-                                "phone", Map.of("type", "string",
-                                        "description", "So dien thoai nguoi nhan"),
-                                "address", Map.of("type", "string",
-                                        "description", "Dia chi giao hang"),
-                                "note", Map.of("type", "string",
-                                        "description", "Ghi chu don hang (tuy chon)"))),
-
-                // 9. Gợi ý theo sở thích
-                tool("recommend",
-                        "Goi y do uong theo so thich. VD: 'socola', 'tra xanh', 'matxa'.",
-                        Map.of("preference", Map.of("type", "string",
-                                "description", "So thich hoac ban than (tuy chon)"))
-                        )
-        );
+    private String buildAddToCartFollowUp(ConfirmationState.PendingAction pending) {
+        return String.format(
+                "Thêm %dx %s (size %s) vào giỏ rồi nha con! 🛒\n%s",
+                pending.quantity(), pending.itemName(), pending.size(),
+                buildContinuePrompt());
     }
 
-    private Map<String, Object> tool(String name, String desc, Map<String, Object> params) {
-        Map<String, Object> t = new HashMap<>();
-        t.put("type", "function");
-        Map<String, Object> fn = new HashMap<>();
-        fn.put("name", name);
-        fn.put("description", desc);
-        Map<String, Object> paramObj = new HashMap<>();
-        paramObj.put("type", "object");
-        paramObj.put("properties", params);
-        paramObj.put("required", params.keySet().stream().toList());
-        fn.put("parameters", paramObj);
-        t.put("function", fn);
-        return t;
-    }
-
-    // ── Helpers ─────────────────────────────────────────────────
-
-    private String extractText(JsonNode response) {
-        try {
-            return response.path("choices").get(0)
-                    .path("message").path("content").asText(null);
-        } catch (Exception e) {
-            return null;
-        }
+    private String buildContinuePrompt() {
+        return "Con muốn uống thêm gì nữa không, hay thanh toán luôn? 😊";
     }
 
     private String errorMessage(Exception e) {
@@ -439,18 +798,20 @@ public class GroqService {
             return "Mạng hơi chậm con ơi, con nhắn lại giúp mẹ nha 😅";
         if (msg.contains("connection") || msg.contains("refused"))
             return "Mẹ gặp chút trục trặc kết nối, con chờ một lát rồi thử lại nhe 😅";
-        if (msg.contains("rate limit") || msg.contains("429"))
+        if (msg.contains("429") || msg.contains("rate limit") || msg.contains("quota")
+                || msg.contains("resource exhausted"))
             return "Mẹ đang bận lắc con ơi, con nhắn lại sau 1-2 phút nha 😅";
-        if (msg.contains("401") || msg.contains("unauthorized") || msg.contains("api key"))
+        if (msg.contains("401") || msg.contains("unauthorized") || msg.contains("api key")
+                || msg.contains("invalid"))
             return "Hệ thống đang bảo trì, con thử lại sau ít phút nha 😅";
         return "Mẹ đang bận xíu, con chờ một chút rồi nhắc lại nha 😅";
     }
 
-    // ── Response ────────────────────────────────────────────────
+    // ══════════════════════════════════════════════════════════════
+    //  RESPONSE RECORD
+    // ══════════════════════════════════════════════════════════════
 
     public record ChatResponse(String message, String paymentUrl, Long orderCode) {
-        public ChatResponse(String message) {
-            this(message, null, null);
-        }
+        public ChatResponse(String message) { this(message, null, null); }
     }
 }

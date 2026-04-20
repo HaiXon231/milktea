@@ -107,6 +107,21 @@ public class AiToolFunctions {
         }
     }
 
+    // ── 4b. Xóa toàn bộ giỏ hàng ──────────────────────────────────
+
+    /**
+     * Xóa toàn bộ giỏ hàng.
+     */
+    public String clearCart(Customer customer) {
+        try {
+            cartService.clearCart(customer);
+            return "Đã xóa hết giỏ hàng rồi con! Con muốn đặt món mới không? 😊";
+        } catch (Exception e) {
+            log.error("clearCart failed for customer={}", customer.getId(), e);
+            return "Lỗi khi xóa giỏ: " + e.getMessage();
+        }
+    }
+
     // ── 5. Xóa khỏi giỏ ─────────────────────────────────────────────
 
     public String removeFromCart(Customer customer, String itemId, String size) {
@@ -149,24 +164,12 @@ public class AiToolFunctions {
 
     /**
      * Chốt đơn + tạo link thanh toán payOS.
-     * Gửi kèm thông tin giao hàng (name, phone, address) đã thu thập.
+     * Validation (name/phone/address) đã được GroqService kiểm tra trước khi gọi.
+     * Trả về OrderResult để GroqService parse thành CHECKOUT_THÀNH_CÔNG/THẤT_BẠI.
      */
     public OrderService.OrderResult checkout(Customer customer, String name,
             String phone, String address, String note) {
         try {
-            // Validate delivery info
-            StringBuilder missing = new StringBuilder();
-            if (name == null || name.isBlank()) missing.append("tên, ");
-            if (phone == null || phone.isBlank()) missing.append("số điện thoại, ");
-            if (address == null || address.isBlank()) missing.append("địa chỉ giao hàng, ");
-            if (missing.length() > 0) {
-                String info = missing.toString();
-                return new OrderService.OrderResult(false,
-                        "Còn thiếu: " + info.substring(0, info.length() - 2)
-                                + ". Con nhắn đủ thông tin giúp mẹ nha!",
-                        null, null);
-            }
-
             return orderService.checkout(customer, name, phone, address, note);
         } catch (Exception e) {
             log.error("checkout failed for customer={}", customer.getId(), e);
