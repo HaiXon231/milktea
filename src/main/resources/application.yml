@@ -1,12 +1,14 @@
 spring:
   application:
     name: casso-milktea-bot
+  config:
+    import: optional:classpath:application-secret.yml
 
   # Database
   datasource:
-    url: jdbc:postgresql://${PGHOST:localhost}:${PGPORT:5432}/${PGDATABASE:casso_milktea_bot}
-    username: ${PGUSER:postgres}
-    password: ${PGPASSWORD:23012005}
+    url: ${SPRING_DATASOURCE_URL:jdbc:postgresql://localhost:5432/casso_milktea_bot}
+    username: ${SPRING_DATASOURCE_USERNAME:postgres}
+    password: ${SPRING_DATASOURCE_PASSWORD:}
     driver-class-name: org.postgresql.Driver
 
   jpa:
@@ -25,7 +27,7 @@ spring:
   # AI Configuration (Gemini)
   ai:
     openai:
-      api-key: ${OPENAI_API_KEY:AIzaSyAsfGZuvpsmoXCkyz5ZYjNFyDpeL13IDhE}
+      api-key: ${OPENAI_API_KEY:}
       base-url: https://generativelanguage.googleapis.com/v1beta
       chat:
         options:
@@ -34,14 +36,14 @@ spring:
 # Telegram Bot
 telegram:
   bot:
-    token: ${TELEGRAM_BOT_TOKEN:7957520350:AAHZxkoyfV4k5PDYBxboY67iwp843zY149I}
+    token: ${TELEGRAM_BOT_TOKEN:}
     username: ${TELEGRAM_BOT_USERNAME:home_milktea_bot}
 
 # payOS
 payos:
-  client-id: ${PAYOS_CLIENT_ID:55643e9b-11c3-4f66-8970-7fc1abdd1f35}
-  api-key: ${PAYOS_API_KEY:efd86d9a-c341-44b9-95b6-b903a445e7fd}
-  checksum-key: ${PAYOS_CHECKSUM_KEY:c02fb6c782dceb1df35c1e192117ff008eda1f03105290ed57142bc4688b3d87}
+  client-id: ${PAYOS_CLIENT_ID:}
+  api-key: ${PAYOS_API_KEY:}
+  checksum-key: ${PAYOS_CHECKSUM_KEY:}
 
 # AI mode: "mock" or "openai"
 ai:
