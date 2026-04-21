@@ -334,7 +334,7 @@ public class GroqService {
                                         customer.getId(), itemId, itemName, 
                                         size != null ? normalizeSize(size) : "M", 
                                         qty != null ? qty : 1, raw);
-                                yield raw + ". HÃY HỎI KHÁCH: 'Con uống size M hay L, và lấy mấy ly ạ?'";
+                                yield "Mẹ tìm thấy món " + itemName + " rồi. Con uống size M hay L, và lấy mấy ly ạ?";
                             } else {
                                 // Add directly
                                 String cartResult = toolFunctions.addToCart(customer, itemId, normalizeSize(size), qty);
@@ -378,12 +378,20 @@ public class GroqService {
                 String address = extractString(args, "address");
                 String note = extractString(args, "note");
 
+                // Merge with pending if exists
+                ConfirmationState.PendingAction pending = confirmationState.peek(customer.getId());
+                if (pending != null && pending.type() == ConfirmationState.ActionType.CHECKOUT) {
+                    if (name == null || name.isBlank() || "null".equals(name)) name = pending.itemId();
+                    if (phone == null || phone.isBlank() || "null".equals(phone)) phone = pending.itemName();
+                    if (address == null || address.isBlank() || "null".equals(address)) address = pending.size();
+                    if (note == null || note.isBlank() || "null".equals(note)) note = pending.context();
+                }
+
                 // Validate — if missing info, DO NOT call checkout
                 String missing = validateDeliveryInfo(name, phone, address);
                 if (missing != null) {
-                    confirmationState.clear(customer.getId()); // clear stale state
-                    yield "THIẾU_THÔNG_TIN: " + missing
-                            + ". Hãy hỏi khách cung cấp thông tin còn thiếu.";
+                    confirmationState.saveCheckoutInfo(customer.getId(), name, phone, address, note);
+                    yield "Mẹ cần thêm " + missing + " để lên đơn cho con nha. Con nhắn nốt cho mẹ nhé!";
                 }
 
                 // All info present — execute checkout
@@ -415,11 +423,11 @@ public class GroqService {
      */
     private String validateDeliveryInfo(String name, String phone, String address) {
         StringBuilder sb = new StringBuilder();
-        if (name == null || name.isBlank())
+        if (name == null || name.isBlank() || "null".equals(name))
             sb.append("tên người nhận, ");
-        if (phone == null || phone.isBlank())
+        if (phone == null || phone.isBlank() || "null".equals(phone))
             sb.append("số điện thoại, ");
-        if (address == null || address.isBlank())
+        if (address == null || address.isBlank() || "null".equals(address))
             sb.append("địa chỉ giao hàng, ");
         if (sb.isEmpty())
             return null;
@@ -657,6 +665,13 @@ public class GroqService {
                     + "Neu khach noi 'huy' -> xoa pending",
                     pending.itemName(), pending.size(), pending.quantity(), pending.itemId(),
                     pending.itemId(), pending.quantity()));
+        } else if (pending != null && pending.type() == ConfirmationState.ActionType.CHECKOUT) {
+            sb.append(String.format(
+                    "\n\nDANG CHO THONG TIN GIAO HANG:\n"
+                    + "Ten: %s\nSDT: %s\nDia chi: %s\n"
+                    + "Hay nho nhung thong tin nay va chi hoi khach cac thong tin con thieu (nhung truong 'null' hoac rong). "
+                    + "Tuyet doi khong duoc hoi lai thong tin khach da cung cap roi!\n",
+                    pending.itemId(), pending.itemName(), pending.size()));
         }
 
         return sb.toString();
