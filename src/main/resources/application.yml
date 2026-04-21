@@ -1,0 +1,56 @@
+spring:
+  application:
+    name: casso-milktea-bot
+
+  # Database
+  datasource:
+    url: jdbc:postgresql://${PGHOST:localhost}:${PGPORT:5432}/${PGDATABASE:casso_milktea_bot}
+    username: ${PGUSER:postgres}
+    password: ${PGPASSWORD:23012005}
+    driver-class-name: org.postgresql.Driver
+
+  jpa:
+    hibernate:
+      ddl-auto: validate
+    show-sql: false
+    properties:
+      hibernate:
+        format_sql: true
+
+  flyway:
+    enabled: true
+    locations: classpath:db/migration
+    baseline-on-migrate: true
+
+  # AI Configuration (Gemini)
+  ai:
+    openai:
+      api-key: ${OPENAI_API_KEY:AIzaSyAsfGZuvpsmoXCkyz5ZYjNFyDpeL13IDhE}
+      base-url: https://generativelanguage.googleapis.com/v1beta
+      chat:
+        options:
+          model: gemini-2.5-flash
+
+# Telegram Bot
+telegram:
+  bot:
+    token: ${TELEGRAM_BOT_TOKEN:7957520350:AAHZxkoyfV4k5PDYBxboY67iwp843zY149I}
+    username: ${TELEGRAM_BOT_USERNAME:home_milktea_bot}
+
+# payOS
+payos:
+  client-id: ${PAYOS_CLIENT_ID:55643e9b-11c3-4f66-8970-7fc1abdd1f35}
+  api-key: ${PAYOS_API_KEY:efd86d9a-c341-44b9-95b6-b903a445e7fd}
+  checksum-key: ${PAYOS_CHECKSUM_KEY:c02fb6c782dceb1df35c1e192117ff008eda1f03105290ed57142bc4688b3d87}
+
+# AI mode: "mock" or "openai"
+ai:
+  mode: ${AI_MODE:openai}
+
+# Server
+server:
+  port: ${PORT:8080}
+
+# App
+app:
+  base-url: ${APP_BASE_URL:http://localhost:8080}
