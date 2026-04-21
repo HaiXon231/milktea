@@ -1,12 +1,18 @@
 package com.casso.milktea.controller;
 
+import com.casso.milktea.service.OrderService;
+import lombok.RequiredArgsConstructor;
 import org.springframework.web.bind.annotation.GetMapping;
 import org.springframework.web.bind.annotation.RequestMapping;
+import org.springframework.web.bind.annotation.RequestParam;
 import org.springframework.web.bind.annotation.RestController;
 
 @RestController
 @RequestMapping("/payment")
+@RequiredArgsConstructor
 public class PaymentRedirectController {
+
+    private final OrderService orderService;
 
     @GetMapping(value = "/success", produces = "text/html;charset=UTF-8")
     public String paymentSuccess() {
@@ -37,7 +43,10 @@ public class PaymentRedirectController {
     }
 
     @GetMapping(value = "/cancel", produces = "text/html;charset=UTF-8")
-    public String paymentCancel() {
+    public String paymentCancel(@RequestParam(required = false) Long orderCode) {
+        if (orderCode != null) {
+            orderService.cancelPayment(orderCode);
+        }
         return """
                 <html>
                 <head>

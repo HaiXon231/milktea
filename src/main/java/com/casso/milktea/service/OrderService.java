@@ -104,9 +104,6 @@ public class OrderService {
             order.setPaymentUrl(response.getCheckoutUrl());
             orderRepository.save(order);
 
-            // Clear the cart ONLY after successfully creating payment link
-            cartService.clearCart(customer);
-
             // Build order summary
             StringBuilder sb = new StringBuilder();
             sb.append("📋 ĐƠN HÀNG #").append(orderCode).append("\n");
@@ -120,7 +117,7 @@ public class OrderService {
             }
             sb.append(String.format("\n💰 Tổng cộng: %,dđ\n", totalAmount));
             sb.append("\n💳 LINK THANH TOÁN QR:\n").append(response.getCheckoutUrl());
-            sb.append("\n\nCon nhấn vào link trên để quét QR thanh toán nha!");
+            sb.append("\n\nCon nhấn vào link trên để quét QR thanh toán nha! Mẹ vẫn giữ giỏ hàng cho con nếu con chưa thanh toán nhé.");
 
             return new OrderResult(true, sb.toString(), response.getCheckoutUrl(), orderCode);
 
@@ -150,7 +147,28 @@ public class OrderService {
         }
 
         order.setStatus(OrderStatus.PAID);
-        return orderRepository.save(order);
+        Order savedOrder = orderRepository.save(order);
+
+        // Clear cart now that payment is confirmed
+        if (savedOrder.getCustomer() != null) {
+            cartService.removeOrderItems(savedOrder.getCustomer(), savedOrder);
+        }
+
+        return savedOrder;
+    }
+
+    /**
+     * Cancel an order if it is awaiting payment.
+     */
+    @Transactional
+    public void cancelPayment(long orderCode) {
+        orderRepository.findByOrderCodeWithCustomer(orderCode).ifPresent(order -> {
+            if (order.getStatus() == OrderStatus.AWAITING_PAYMENT) {
+                order.setStatus(OrderStatus.CANCELLED);
+                orderRepository.save(order);
+                log.info("Order {} cancelled by user", orderCode);
+            }
+        });
     }
 
     /**

@@ -3,6 +3,8 @@ package com.casso.milktea.service;
 import com.casso.milktea.model.CartItem;
 import com.casso.milktea.model.Customer;
 import com.casso.milktea.model.MenuItem;
+import com.casso.milktea.model.Order;
+import com.casso.milktea.model.OrderItem;
 import com.casso.milktea.repository.CartItemRepository;
 import lombok.RequiredArgsConstructor;
 import org.springframework.stereotype.Service;
@@ -144,6 +146,28 @@ public class CartService {
     @Transactional
     public void clearCart(Customer customer) {
         cartItemRepository.deleteByCustomerId(customer.getId());
+    }
+
+    /**
+     * Remove specific items from the cart based on an order.
+     */
+    @Transactional
+    public void removeOrderItems(Customer customer, Order order) {
+        for (OrderItem orderItem : order.getItems()) {
+            Optional<CartItem> existingOpt = cartItemRepository
+                    .findByCustomerIdAndMenuItemItemIdAndSize(customer.getId(), orderItem.getItemId(), orderItem.getSize());
+            
+            if (existingOpt.isPresent()) {
+                CartItem cartItem = existingOpt.get();
+                int remaining = cartItem.getQuantity() - orderItem.getQuantity();
+                if (remaining <= 0) {
+                    cartItemRepository.delete(cartItem);
+                } else {
+                    cartItem.setQuantity(remaining);
+                    cartItemRepository.save(cartItem);
+                }
+            }
+        }
     }
 
     /**

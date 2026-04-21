@@ -7,6 +7,8 @@ import org.springframework.stereotype.Service;
 
 import java.util.List;
 import java.util.Optional;
+import java.text.Normalizer;
+import java.util.regex.Pattern;
 
 @Service
 @RequiredArgsConstructor
@@ -77,44 +79,72 @@ public class MenuService {
     }
 
     /**
+     * Remove Vietnamese diacritics.
+     */
+    private String removeDiacritics(String str) {
+        if (str == null) return null;
+        String nfdNormalizedString = Normalizer.normalize(str, Normalizer.Form.NFD); 
+        Pattern pattern = Pattern.compile("\\p{InCombiningDiacriticalMarks}+");
+        return pattern.matcher(nfdNormalizedString).replaceAll("")
+                .replace('đ', 'd').replace('Đ', 'D');
+    }
+
+    /**
      * Fuzzy search by Vietnamese name.
      * Searches in itemId (exact), name (contains), category (contains).
      * Returns the best match, or empty if no match found.
      */
     public Optional<MenuItem> findByName(String query) {
         if (query == null || query.isBlank()) return Optional.empty();
-        String q = query.trim().toLowerCase();
+        String originalQ = query.trim().toLowerCase();
+        String q = removeDiacritics(originalQ);
         List<MenuItem> all = menuItemRepository.findByAvailableTrue();
+        
         // Exact match on itemId first
         for (MenuItem item : all) {
-            if (item.getItemId().equalsIgnoreCase(q)) {
+            if (item.getItemId().equalsIgnoreCase(originalQ)) {
                 return Optional.of(item);
             }
         }
-        // Contains match on name
-        for (MenuItem item : all) {
-            String name = item.getName().toLowerCase();
-            String cat = item.getCategory().toLowerCase();
-            if (name.contains(q) || cat.contains(q) || q.contains(name)) {
-                return Optional.of(item);
-            }
-        }
-        // Fuzzy: match each word
+
+        // Fuzzy: match each word on normalized string
         String[] words = q.split("\\s+");
         MenuItem best = null;
-        int bestScore = 0;
+        double bestScore = 0;
+        
         for (MenuItem item : all) {
-            String name = item.getName().toLowerCase();
-            int score = 0;
-            for (String w : words) {
-                if (name.contains(w)) score++;
+            String nameRaw = item.getName().toLowerCase();
+            String nameNormalized = removeDiacritics(nameRaw);
+            String catNormalized = removeDiacritics(item.getCategory().toLowerCase());
+            
+            // Full string exact match (ignoring diacritics) is an instant win
+            if (nameNormalized.equals(q)) {
+                return Optional.of(item);
             }
-            if (score > bestScore) {
-                bestScore = score;
-                best = item;
+            
+            int matchCount = 0;
+            for (String w : words) {
+                if (nameNormalized.contains(w) || catNormalized.contains(w)) {
+                    matchCount++;
+                }
+            }
+            
+            if (matchCount > 0) {
+                // Score = (matches / total_words) - penalty for longer names
+                // This favors "Trân châu đen" over "Trà sữa trân châu đen" when query is "trân châu đen"
+                double score = (double) matchCount;
+                // penalty: length difference
+                double penalty = (double) Math.abs(nameNormalized.length() - q.length()) * 0.01;
+                score = score - penalty;
+                
+                if (score > bestScore) {
+                    bestScore = score;
+                    best = item;
+                }
             }
         }
-        if (bestScore >= Math.ceil(words.length / 2.0)) {
+        
+        if (best != null && bestScore > 0) {
             return Optional.of(best);
         }
         return Optional.empty();

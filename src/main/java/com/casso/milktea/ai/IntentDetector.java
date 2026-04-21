@@ -54,17 +54,15 @@ public class IntentDetector {
             return DetectedIntent.viewCart();
         }
 
+        // CLEAR CART - must be before REMOVE SPECIFIC ITEM to avoid "xóa hết" being seen as removing an item named "hết"
+        if (isClearCartRequest(lower, msg)) {
+            return DetectedIntent.clearCart();
+        }
+
         // REMOVE SPECIFIC ITEM from cart — "hủy trà dâu tây", "xóa trà sữa socola"
         if (isRemoveItemRequest(lower, msg)) {
             String itemName = extractItemNameFromRemoveRequest(lower, msg);
             return DetectedIntent.removeItem(itemName);
-        }
-
-        // CLEAR CART
-        if (lower.equals("xóa giỏ") || lower.equals("bỏ giỏ") || lower.equals("hủy giỏ")
-                || lower.equals("xóa hết") || lower.equals("bỏ hết") || lower.equals("clear cart")
-                || lower.equals("reset cart") || lower.equals("xóa đơn") || lower.equals("hủy đơn")) {
-            return DetectedIntent.clearCart();
         }
 
         // BEST SELLER
@@ -157,6 +155,25 @@ public class IntentDetector {
         return false;
     }
 
+    private boolean isClearCartRequest(String lower, String original) {
+        String[] exacts = {"xóa giỏ", "bỏ giỏ", "hủy giỏ", "xóa hết", "bỏ hết", "clear cart", "reset cart", "xóa đơn", "hủy đơn", "xóa giỏ hàng", "hủy giỏ hàng", "bỏ giỏ hàng"};
+        for (String e : exacts) {
+            if (lower.equals(e)) return true;
+        }
+        
+        boolean hasAction = lower.contains("xóa") || lower.contains("xoa") || lower.contains("hủy") || lower.contains("huy") || lower.contains("bỏ") || lower.contains("bo");
+        boolean hasTarget = lower.contains("tất cả") || lower.contains("tat ca") || lower.contains("hết") || lower.contains("het") || lower.contains("toàn bộ") || lower.contains("toan bo");
+        boolean hasCart = lower.contains("giỏ") || lower.contains("gio") || lower.contains("cart");
+        
+        // e.g. "xóa hết tất cả món đang trong giỏ hàng" -> hasAction and hasTarget
+        // "hủy toàn bộ giỏ" -> hasAction and hasTarget and hasCart
+        if (hasAction && hasTarget) {
+            return true;
+        }
+        
+        return false;
+    }
+
     private boolean isBestSellerRequest(String lower, String original) {
         if (lower.equals("bán chạy") || lower.equals("ban chay")
                 || lower.equals("best seller") || lower.equals("hot")
@@ -211,14 +228,12 @@ public class IntentDetector {
 
     /**
      * Detects "hủy [món]", "xóa [món]", "bỏ [món]" — remove specific item from cart.
-     * Examples: "hủy trà dâu tây", "xóa trà sữa socola", "bỏ ly matcha đi"
+     * Examples: "hủy trà dâu tây", "xóa trà sữa socola", "bỏ ly matcha đi", "tôi muốn hủy trà xoài"
      */
     private boolean isRemoveItemRequest(String lower, String original) {
-        String[] removePrefixes = {"hủy", "huy", "xóa", "xoa", "bỏ", "bo", "xóa ly", "xoa ly",
-                "bỏ ly", "bo ly", "hủy ly", "huy ly"};
+        String[] removePrefixes = {"hủy", "huy", "xóa", "xoa", "bỏ", "bo"};
         for (String prefix : removePrefixes) {
-            if (lower.startsWith(prefix + " ") || lower.startsWith(prefix + " ly ")
-                    || lower.startsWith(prefix + " đi") || lower.startsWith(prefix + " di")) {
+            if (lower.startsWith(prefix + " ") || lower.contains(" " + prefix + " ")) {
                 return true;
             }
         }
@@ -229,13 +244,15 @@ public class IntentDetector {
      * Extract the item name from a remove request.
      * "hủy trà dâu tây" → "trà dâu tây"
      * "xóa ly trà sữa socola đi" → "trà sữa socola"
+     * "tôi muốn hủy trà xoài" → "trà xoài"
      */
     private String extractItemNameFromRemoveRequest(String lower, String original) {
-        String[] prefixes = {"hủy ly", "huy ly", "hủy ", "huy ", "xóa ly", "xoa ly",
-                "xóa ", "xoa ", "bỏ ly", "bo ly", "bỏ ", "bo "};
+        String[] prefixes = {"hủy ly", "huy ly", "hủy", "huy", "xóa ly", "xoa ly",
+                "xóa", "xoa", "bỏ ly", "bo ly", "bỏ", "bo"};
         for (String prefix : prefixes) {
-            if (lower.startsWith(prefix)) {
-                String name = lower.substring(prefix.length()).trim();
+            int idx = lower.indexOf(prefix + " ");
+            if (idx == 0 || (idx > 0 && lower.charAt(idx - 1) == ' ')) {
+                String name = lower.substring(idx + prefix.length()).trim();
                 // Remove trailing "đi", "di", "với"
                 if (name.endsWith(" đi") || name.endsWith(" di")) {
                     name = name.substring(0, name.length() - 3).trim();

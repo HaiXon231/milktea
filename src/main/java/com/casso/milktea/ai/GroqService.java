@@ -259,6 +259,7 @@ public class GroqService {
                     contents.add(part("model", text));
                 }
 
+                String lastToolResult = null;
                 // Execute each tool and append results
                 for (Map<String, Object> tc : toolCalls) {
                     String toolName = (String) tc.get("name");
@@ -267,6 +268,7 @@ public class GroqService {
                     contents.add(functionResponsePart(toolName, result));
                     log.info("Tool [{}] → {}", toolName,
                             result.length() > 120 ? result.substring(0, 120) + "..." : result);
+                    lastToolResult = result;
                 }
 
                 // Turn 2: Gemini generates natural response.
@@ -279,8 +281,10 @@ public class GroqService {
                 if (!onlyFindItem) {
                     response = callGeminiWithRetry(contents, false);
                     text = extractText(response);
+                } else {
+                    // If only find_item_by_name: skip Turn 2, use the add_to_cart result as-is
+                    text = lastToolResult;
                 }
-                // If only find_item_by_name: skip Turn 2, use the add_to_cart result as-is
             }
 
             if (text == null || text.isBlank()) {
@@ -310,6 +314,7 @@ public class GroqService {
 
         return switch (toolName) {
             case "find_item_by_name" -> {
+                String intentStr = extractString(args, "intent");
                 String raw = toolFunctions.findItemByName(extractString(args, "name"));
 
                 if (raw != null && raw.startsWith("FOUND:")) {
@@ -318,24 +323,28 @@ public class GroqService {
                     if (parts.length >= 4) {
                         String itemId = parts[0].trim();
                         String itemName = parts[1].trim();
-                        String priceM = parts[2].trim();
-                        String priceL = parts[3].trim();
 
-                        // CRITICAL FIX: Execute add_to_cart HERE, not in Turn 2.
-                        // Gemini may not call the tool — we can't rely on it.
-                        // Adding directly guarantees the cart is updated.
-                        String cartResult = toolFunctions.addToCart(customer, itemId, "M", 1);
+                        if ("add".equalsIgnoreCase(intentStr) || intentStr == null) {
+                            String size = extractString(args, "size");
+                            Integer qty = extractIntOrNull(args, "quantity");
 
-                        // Save pending state for potential size override ("M", "L")
-                        confirmationState.saveAddToCart(
-                                customer.getId(), itemId, itemName, "M", 1, raw);
-
-                        // Return cart result directly — this IS the response
-                        // (don't let Gemini "improve" it and accidentally skip the add)
-                        yield cartResult;
+                            if (size == null || qty == null) {
+                                // Missing size or quantity, save pending state and ask user
+                                confirmationState.saveAddToCart(
+                                        customer.getId(), itemId, itemName, 
+                                        size != null ? normalizeSize(size) : "M", 
+                                        qty != null ? qty : 1, raw);
+                                yield raw + ". HÃY HỎI KHÁCH: 'Con uống size M hay L, và lấy mấy ly ạ?'";
+                            } else {
+                                // Add directly
+                                String cartResult = toolFunctions.addToCart(customer, itemId, normalizeSize(size), qty);
+                                confirmationState.clear(customer.getId());
+                                yield cartResult;
+                            }
+                        }
                     }
                 }
-                // Not found or error — return as-is for Gemini to handle
+                // Not found, error, or not an 'add' intent — return as-is for Gemini to handle
                 yield raw;
             }
 
@@ -608,9 +617,8 @@ public class GroqService {
                 ================
 
                 1. TIM MON: Khach noi ten mon bat ky
-                   -> goi find_item_by_name(ten_mon)
-                   -> FOUND -> GOI NGAY add_to_cart(ma, size, soluong)
-                      KHONG hoi xac nhan gi ca
+                   -> goi find_item_by_name(ten_mon, size, soluong)
+                   -> Neu ham tra ve yeu cau hoi lai khach -> BAN PHAI HOI LAI: "Con uong size M hay L, va lay may ly a?"
                    -> KHONG TIM THAY -> tra loi "khong co mon nay, con thu ten khac nha"
 
                 2. XEM MENU: "menu", "thuc don"
@@ -663,9 +671,12 @@ public class GroqService {
                 fd("find_item_by_name",
                         "Tim mon trong menu bang ten tieng Viet. "
                                 + "VD: 'tra sua socola', 'matcha', 'sua tuoi'. "
-                                + "Tra ve 'FOUND:itemId|ten|priceM|priceL' hoac loi khong tim thay.",
-                        List.of(param("name", "string",
-                                "Ten mon tieng Viet (VD: 'tra sua socola', 'matcha')"))),
+                                + "Neu khach co noi size hoac so luong thi truyen vao.",
+                        List.of(
+                                param("name", "string", "Ten mon tieng Viet (VD: 'tra sua socola', 'matcha')"),
+                                param("intent", "string", "Muc dich: 'add' (de them vao gio), 'remove' (de xoa), 'info' (de xem gia/thong tin)"),
+                                param("size", "string", "Size khach muon (M/L). De trong neu khach chua noi ro"),
+                                param("quantity", "integer", "So luong. De trong neu khach chua noi ro"))),
 
                 fd("get_menu",
                         "Xem TOAN BO menu: ten mon, gia M/L theo tung danh muc. "
@@ -759,6 +770,11 @@ public class GroqService {
     private int extractInt(JsonNode args, String field, int fallback) {
         JsonNode n = args.path(field);
         return n.isMissingNode() || n.isNull() ? fallback : n.asInt();
+    }
+
+    private Integer extractIntOrNull(JsonNode args, String field) {
+        JsonNode n = args.path(field);
+        return n.isMissingNode() || n.isNull() ? null : n.asInt();
     }
 
     private String normalizeSize(String size) {
