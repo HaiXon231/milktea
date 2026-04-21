@@ -21,7 +21,10 @@ A seamless conversational checkout experience that feels like chatting with a re
 - ✓ Keep cart intact until payment succeeds (delay clearCart until payOS webhook confirmation) — v1.0
 
 ### Active
-- [ ] Tính năng Recommend món thông minh dựa trên lịch sử mua (Gợi ý cho Milestone tiếp theo)
+- [ ] Tích hợp thông báo qua Telegram cho Staff/Admin (Staff Notification)
+- [ ] Lưu trữ thông tin giao hàng mặc định của khách (Persistent User Profile)
+- [ ] Khả năng tra cứu tình trạng đơn hàng và đặt lại món cũ (Order Tracking & Re-order)
+- [ ] Gợi ý món thông minh dựa trên lịch sử mua (Smart Recommendation)
 
 ### Out of Scope
 - [None yet]
@@ -31,7 +34,24 @@ A seamless conversational checkout experience that feels like chatting with a re
 |----------|-----------|---------|
 | Use Groq direct HTTP API | Overcome Spring AI function calling instability | Working |
 | Builder pattern | Replace Lombok for reliable bytecode generation | Working |
-| Delay cart clearance | Ensure users do not lose their cart if payment is cancelled or fails | Pending |
+| Delay cart clearance | Ensure users do not lose their cart if payment is cancelled or fails | Working |
+
+## Evolution
+
+This document evolves at phase transitions and milestone boundaries.
+
+**After each phase transition** (via `/gsd-transition`):
+1. Requirements invalidated? → Move to Out of Scope with reason
+2. Requirements validated? → Move to Validated with phase reference
+3. New requirements emerged? → Add to Active
+4. Decisions to log? → Add to Key Decisions
+5. "What This Is" still accurate? → Update if drifted
+
+**After each milestone** (via `/gsd-complete-milestone`):
+1. Full review of all sections
+2. Core Value check — still the right priority?
+3. Audit Out of Scope — reasons still valid?
+4. Update Context with current state
 
 ---
-*Last updated: 2026-04-21 after initialization*
+*Last updated: 2026-04-21 after starting v1.1*
